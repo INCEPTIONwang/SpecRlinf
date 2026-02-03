@@ -1,7 +1,7 @@
 defaults:
   - env/metaworld_50@env.train
   - env/metaworld_50@env.eval
-  - model/pi0@actor.model
+  - model/pi0_5@actor.model
   - training_backend/fsdp@actor.fsdp_config
   - override hydra/job_logging: stdout
 
@@ -22,7 +22,7 @@ runner:
   logger:
     log_path: "../results"
     project_name: rlinf
-    experiment_name: "metaworld_50_ppo_openpi"
+    experiment_name: "metaworld_50_ppo_openpi_pi05"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
   max_epochs: 1000
@@ -42,7 +42,8 @@ algorithm:
   reward_coef: 1.0
 
   rollout_epoch: 8
-  eval_rollout_epoch: 500 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+  eval_rollout_epoch: 50 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+
   reward_type: chunk_level
   logprob_type: chunk_level
   entropy_type: token_level
@@ -88,9 +89,9 @@ env:
 
   # Override the default values in env/metaworld_50
   train:
-    total_num_envs: 64
-  eval:
     total_num_envs: 1
+  eval:
+    total_num_envs: 10
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 100
@@ -105,6 +106,7 @@ rollout:
   group_name: "RolloutGroup"
   generation_backend: "huggingface"
   recompute_logprobs: False
+  unnorm_key: libero_10
   enable_offload: False
   pipeline_stage_num: 1
 
@@ -120,21 +122,35 @@ actor:
   seed: 42
   enable_offload: False
 
-  # Override the default values in model/pi0
+  # Override the default values in model/pi0_5
   model:
     model_path: "/home/my/data/wxh/openpi/checkpoints/RLinf-Pi05-MetaWorld-RL-FlowSDE"
-    num_action_chunks: 5 # interface for the env
+    num_action_chunks: 15 # interface for the env
     action_dim: 4
-    num_steps: 5
     add_value_head: True
     # openpi specific parameters
     openpi:
-      config_name: "pi0_metaworld"
+      config_name: "pi05_metaworld"
       num_images_in_input: 1
-      detach_critic_input: True
+      action_horizon: 15
+      value_after_vlm: True
+      enable_speculative: False
+      spec_batch_size: 8
+      spec_action_horizon: 15
+      spec_diffusion_num_steps: 5
+      spec_chunk_size: 5
+      rollout_segment: False
+      rollout_segment_size: 5
+      spec_conf_alpha: 0.8
+      spec_conf_eps: 1.0e-8
+      spec_delta_thresholds: [.3,.3, 3.0]
+      # spec_delta_thresholds: [.5,.5, 3.0]
+      spec_debug: True
+      spec_profile_timing: False
+      
 
   optim:
-    lr: 1.0e-5
+    lr: 5.0e-6
     value_lr: 1.0e-4
     adam_beta1: 0.9
     adam_beta2: 0.95
@@ -142,6 +158,10 @@ actor:
     weight_decay: 0.01
     clip_grad: 1.0
     critic_warmup_steps: 0
+    total_training_steps: ${runner.max_epochs}
+    lr_warmup_steps: -1
+    lr_scheduler: "cosine" # Learning rate scheduler type. Choices: ["constant", "cosine"]. Default: "constant".
+    num_cycles: 0.5
 
   # Override the default values in training_backend/fsdp
   fsdp_config:

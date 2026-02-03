@@ -44,6 +44,10 @@ class EnvWorker(Worker):
         self.last_terminations_list = []
         self.last_truncations_list = []
         self.last_intervened_info_list = []
+        self._metaworld_env_names = None
+        self._metaworld_task_desc = None
+        self._metaworld_difficulty_map = None
+        self._eval_episode_count = 0
 
         self._component_placement = HybridComponentPlacement(cfg, Cluster())
         assert (
@@ -110,6 +114,13 @@ class EnvWorker(Worker):
                         worker_info=self.worker_info,
                     )
                 )
+            if self.cfg.env.eval.env_type == "metaworld":
+                from rlinf.envs.metaworld import MetaWorldBenchmark
+
+                benchmark = MetaWorldBenchmark(self.cfg.env.eval.task_suite_name)
+                self._metaworld_env_names = benchmark.get_env_names()
+                self._metaworld_task_desc = benchmark.get_task_description()
+                self._metaworld_difficulty_map = benchmark.get_task_difficulty_map()
 
         if not self.only_eval:
             self._init_env()
@@ -215,6 +226,7 @@ class EnvWorker(Worker):
         )
         chunk_dones = torch.logical_or(chunk_terminations, chunk_truncations)
 
+        eval_info = None
         if chunk_dones.any():
             if "episode" in infos:
                 for key in infos["episode"]:
@@ -223,14 +235,89 @@ class EnvWorker(Worker):
                 final_info = infos["final_info"]
                 for key in final_info["episode"]:
                     env_info[key] = final_info["episode"][key][chunk_dones[:, -1]].cpu()
+            eval_info = self._build_metaworld_eval_info(env_info, chunk_dones)
 
         env_output = EnvOutput(
             obs=extracted_obs,
             final_obs=infos["final_observation"]
             if "final_observation" in infos
             else None,
+            dones=chunk_dones,
+            terminations=chunk_terminations,
+            truncations=chunk_truncations,
+            rewards=chunk_rewards,
+            eval_info=eval_info,
         )
         return env_output, env_info
+
+    def _build_metaworld_eval_info(
+        self, env_info: dict[str, Any], chunk_dones: torch.Tensor
+    ) -> list[dict[str, Any] | None] | None:
+        if self._metaworld_env_names is None:
+            return None
+        if "task_id" not in env_info:
+            return None
+        if not torch.is_tensor(chunk_dones):
+            return None
+
+        done_mask = chunk_dones[:, -1] if chunk_dones.ndim == 2 else chunk_dones
+        done_mask_np = done_mask.cpu().numpy().astype(bool)
+        num_envs = int(done_mask_np.size)
+        if num_envs == 0 or not done_mask_np.any():
+            return None
+
+        def _to_numpy(value):
+            if torch.is_tensor(value):
+                return value.cpu().numpy()
+            return np.asarray(value)
+
+        def _select(values):
+            arr = _to_numpy(values)
+            if arr.ndim == 0:
+                arr = arr.reshape(1)
+            if arr.shape[0] == done_mask_np.size:
+                return arr[done_mask_np]
+            return arr
+
+        task_ids = _select(env_info["task_id"]).astype(int)
+        trial_ids = _select(env_info.get("trial_id", np.array([-1])))
+        success = env_info.get("success_once", env_info.get("success_at_end"))
+        if success is None:
+            return None
+        success_arr = _select(success)
+        returns = _select(env_info.get("return", np.array([float("nan")])))
+        episode_len = _select(env_info.get("episode_len", np.array([-1])))
+
+        eval_info: list[dict[str, Any] | None] = [None for _ in range(num_envs)]
+        done_indices = np.flatnonzero(done_mask_np)
+        for i, env_idx in enumerate(done_indices):
+            self._eval_episode_count += 1
+            task_id = int(task_ids[i])
+            if 0 <= task_id < len(self._metaworld_env_names):
+                env_name = self._metaworld_env_names[task_id]
+                desc = self._metaworld_task_desc[task_id]
+            else:
+                env_name = f"task_{task_id}"
+                desc = ""
+            difficulty = self._metaworld_difficulty_map.get(env_name, "unknown")
+            difficulty_label = "Very Hard" if difficulty == "very_hard" else difficulty.title()
+            succ_val = success_arr[i]
+            success_flag = bool(succ_val) if isinstance(succ_val, (bool, np.bool_)) else bool(succ_val > 0.5)
+            trial_id = int(trial_ids[i]) if np.size(trial_ids) > i else -1
+            return_val = float(returns[i]) if np.size(returns) > i else float("nan")
+            episode_len_val = int(episode_len[i]) if np.size(episode_len) > i else -1
+            eval_info[int(env_idx)] = {
+                "episode": int(self._eval_episode_count),
+                "task_id": task_id,
+                "task": env_name,
+                "desc": desc,
+                "difficulty": difficulty_label,
+                "trial_id": trial_id,
+                "success": success_flag,
+                "return": return_val,
+                "episode_len": episode_len_val,
+            }
+        return eval_info
 
     def recv_chunk_actions(self, input_channel: Channel, mode="train") -> np.ndarray:
         assert mode in ["train", "eval"], f"{mode=} is not supported"
@@ -403,10 +490,7 @@ class EnvWorker(Worker):
         for stage_id in range(self.stage_num):
             self.eval_env_list[stage_id].start_env()
 
-        n_chunk_steps = (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
-        )
+        n_chunk_steps = int(self.cfg.env.eval.max_steps_per_rollout_epoch)
         for _ in range(self.cfg.algorithm.eval_rollout_epoch):
             for stage_id in range(self.stage_num):
                 self.eval_env_list[stage_id].is_start = True
@@ -419,7 +503,7 @@ class EnvWorker(Worker):
                 )
                 self.send_env_batch(output_channel, env_output.to_dict(), mode="eval")
 
-            for eval_step in range(n_chunk_steps):
+            for _ in range(n_chunk_steps):
                 for stage_id in range(self.stage_num):
                     raw_chunk_actions = self.recv_chunk_actions(
                         input_channel, mode="eval"
@@ -430,8 +514,6 @@ class EnvWorker(Worker):
 
                     for key, value in env_info.items():
                         eval_metrics[key].append(value)
-                    if eval_step == n_chunk_steps - 1:
-                        continue
                     self.send_env_batch(
                         output_channel, env_output.to_dict(), mode="eval"
                     )

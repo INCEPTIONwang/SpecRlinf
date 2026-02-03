@@ -77,7 +77,13 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         self.max_prompt_length = max_prompt_length
 
-    def _build_embedding(self, input_ids, attention_mask, pixel_values):
+    def _build_embedding(
+        self,
+        input_ids,
+        attention_mask,
+        pixel_values,
+        cond_action_mask: Optional[torch.Tensor] = None,
+    ):
         assert torch.all(input_ids[:, -1] == STOP_INDEX)
         assert input_ids.shape[0] == attention_mask.shape[0]
         assert input_ids.shape[1] == attention_mask.shape[1]
@@ -95,6 +101,14 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         all_actions_mask[:, -self.action_dim * self.num_action_chunks :] = (
             True  # [B, L + act + 1], [many x 0; act x 1; 0]
         )
+        if cond_action_mask is not None:
+            if cond_action_mask.ndim == 3:
+                cond_action_mask = cond_action_mask.reshape(cond_action_mask.shape[0], -1)
+            cond_action_mask = cond_action_mask.to(
+                device=input_ids.device, dtype=torch.bool
+            )
+            # Unmask conditional action tokens so they can condition the model.
+            all_actions_mask[:, -self.action_dim * self.num_action_chunks :] &= ~cond_action_mask
 
         input_embeddings = self.get_input_embeddings()(input_ids)  # [B, L + act + 1, D]
         input_embeddings = input_embeddings * (~all_actions_mask.unsqueeze(-1))
@@ -131,15 +145,51 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         unnorm_key = self._check_unnorm_key(self.norm_stats, self.unnorm_key)
         return self.norm_stats[unnorm_key]["action"]
 
-    def _prepare_input_for_action_prediction(self, input_ids, attention_mask):
-        """Prepares input for action prediction by adding necessary tokens"""
+    def _prepare_input_for_action_prediction(
+        self,
+        input_ids,
+        attention_mask,
+        cond_action_tokens: Optional[torch.Tensor] = None,
+        cond_action_mask: Optional[torch.Tensor] = None,
+    ):
+        """Prepares input for action prediction by adding necessary tokens.
+
+        Optionally fills action placeholder tokens with conditional action tokens.
+        """
         # Add (ACTION_DIM * NUM_ACTIONS_CHUNK) placeholder tokens to input_ids to simulate action tokens
-        placeholder_action_token_ids = (
-            torch.ones((input_ids.shape[0], self.action_dim * self.num_action_chunks))
-            .to(input_ids.device)
-            .to(input_ids.dtype)
+        placeholder_action_token_ids = torch.ones(
+            (input_ids.shape[0], self.action_dim * self.num_action_chunks),
+            device=input_ids.device,
+            dtype=input_ids.dtype,
         )
         input_ids = torch.cat([input_ids, placeholder_action_token_ids], dim=-1)
+
+        # Optionally inject conditional action tokens into the placeholder positions.
+        if cond_action_tokens is not None:
+            if cond_action_tokens.ndim == 3:
+                cond_action_tokens = cond_action_tokens.reshape(
+                    cond_action_tokens.shape[0], -1
+                )
+            cond_action_tokens = cond_action_tokens.to(
+                device=input_ids.device, dtype=input_ids.dtype
+            )
+            action_slice = input_ids[
+                :, -self.action_dim * self.num_action_chunks :
+            ]  # without STOP token yet
+            if cond_action_mask is not None:
+                if cond_action_mask.ndim == 3:
+                    cond_action_mask = cond_action_mask.reshape(
+                        cond_action_mask.shape[0], -1
+                    )
+                cond_action_mask = cond_action_mask.to(
+                    device=input_ids.device, dtype=torch.bool
+                )
+                action_slice[cond_action_mask] = cond_action_tokens[cond_action_mask]
+            else:
+                action_slice[:] = cond_action_tokens
+            input_ids[
+                :, -self.action_dim * self.num_action_chunks :
+            ] = action_slice
 
         # Add stop token to sequence (needed in non-causal bi-directional self-attention, as it appears at train time)
         stop_token_id = (
@@ -202,6 +252,312 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
 
         return actions
 
+    def _tokens_to_actions(self, token_ids: torch.Tensor) -> np.ndarray:
+        """Convert action token ids to unnormalized continuous actions."""
+        if token_ids.ndim == 3:
+            batch_size, num_chunks, action_dim = token_ids.shape
+            token_ids = token_ids.reshape(batch_size, -1)
+        else:
+            batch_size = token_ids.shape[0]
+            action_dim = self.action_dim
+            num_chunks = int(token_ids.shape[1] // action_dim)
+        token_ids_np = token_ids.detach().cpu().numpy()
+        discretized_actions = self.vocab_size - token_ids_np
+        discretized_actions = np.clip(
+            discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1
+        )
+        normalized_actions = np.asarray(
+            [self.bin_centers[da] for da in discretized_actions]
+        )
+        normalized_actions = normalized_actions.reshape(-1, action_dim)
+        actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
+        actions = actions.reshape(batch_size, num_chunks, action_dim)
+        return actions
+
+    def _forward_action_logits(
+        self,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        n_prompt_tokens: int,
+        n_patches: int,
+        *,
+        cond_action_tokens: Optional[torch.Tensor] = None,
+        cond_action_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        input_ids, attention_mask = self._prepare_input_for_action_prediction(
+            input_ids,
+            attention_mask,
+            cond_action_tokens=cond_action_tokens,
+            cond_action_mask=cond_action_mask,
+        )
+        assert torch.all(input_ids[:, -1] == STOP_INDEX)  # [B, L + act + 1]
+        assert torch.all(
+            attention_mask[:, -1 - self.action_dim * self.num_action_chunks :] == 1
+        )
+
+        mm_embeddings, mm_attention_mask = self._build_embedding(
+            input_ids, attention_mask, pixel_values, cond_action_mask=cond_action_mask
+        )
+        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
+
+        outputs = self.language_model(
+            input_ids=None,
+            attention_mask=mm_attention_mask,
+            position_ids=multimodal_position_ids,
+            past_key_values=None,
+            inputs_embeds=mm_embeddings,
+            labels=None,
+            use_cache=None,
+            output_attentions=False,
+            output_hidden_states=True,
+            return_dict=True,
+        )
+
+        logits_tensor = outputs.logits[
+            :,
+            n_patches + n_prompt_tokens : n_patches
+            + n_prompt_tokens
+            + self.action_dim * self.num_action_chunks,
+            :,
+        ]
+        last_hidden_states = outputs.hidden_states[-1][
+            :, -self.action_dim * self.num_action_chunks - 1 : -1
+        ]
+
+        return logits_tensor, last_hidden_states
+
+    def _speculative_verify_tokens(
+        self,
+        *,
+        draft_tokens: torch.Tensor,
+        draft_logprobs: torch.Tensor,
+        input_ids: torch.LongTensor,
+        attention_mask: torch.Tensor,
+        pixel_values: torch.FloatTensor,
+        n_prompt_tokens: int,
+        n_patches: int,
+        spec_chunk_size: int,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Run speculative + sequential verification on draft action tokens."""
+        batch_size, horizon, action_dim = draft_tokens.shape
+        device = draft_tokens.device
+
+        draft_conf = draft_logprobs.mean(dim=2).detach().cpu().numpy()
+
+        accepted_conf = torch.zeros((batch_size, horizon), dtype=torch.bool, device=device)
+        accepted_seq = torch.zeros((batch_size, horizon), dtype=torch.bool, device=device)
+        accepted_conf[:, 0] = True
+        accepted_seq[:, 0] = True
+        accepted_rank_conf = torch.zeros((batch_size,), dtype=torch.long, device=device)
+        accepted_rank_seq = torch.zeros((batch_size,), dtype=torch.long, device=device)
+
+        conf_active = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        seq_active = torch.ones((batch_size,), dtype=torch.bool, device=device)
+        fail_pos_conf = [None] * batch_size
+        fail_pos_seq = [None] * batch_size
+        fail_action_conf = [None] * batch_size
+        fail_action_seq = [None] * batch_size
+        conf_stop_prefix_len = [None] * batch_size
+        seq_stop_prefix_len = [None] * batch_size
+
+        def _prefix_len(mask: torch.Tensor) -> int:
+            length = 1
+            for t in range(1, horizon):
+                if not bool(mask[t].item()):
+                    break
+                length += 1
+            return length
+
+        final_tokens = draft_tokens.clone()
+
+        chunk_size = int(spec_chunk_size)
+        if chunk_size <= 0:
+            return final_tokens, {}
+        if horizon % chunk_size != 0:
+            raise ValueError(
+                f"spec_chunk_size must divide action horizon: h={horizon} chunk={chunk_size}"
+            )
+
+        for start in range(1, horizon, chunk_size):
+            end = min(start + chunk_size, horizon)
+
+            order_conf_list = [None] * batch_size
+            order_seq_list = [None] * batch_size
+            task_indices_conf: list[list[int]] = [[] for _ in range(batch_size)]
+            task_indices_seq: list[list[int]] = [[] for _ in range(batch_size)]
+            task_env_idx: list[int] = []
+            task_cond_tokens: list[torch.Tensor] = []
+            task_cond_mask: list[torch.Tensor] = []
+
+            for b in range(batch_size):
+                if not conf_active[b] and not seq_active[b]:
+                    continue
+                pos = np.arange(start, end, dtype=np.int64)
+                order_seq = pos
+                order_seq_list[b] = order_seq
+                if conf_active[b]:
+                    conf_vals = draft_conf[b, pos]
+                    order_conf = pos[np.lexsort((pos, -conf_vals))]
+                else:
+                    order_conf = np.array([], dtype=np.int64)
+                order_conf_list[b] = order_conf
+
+                if conf_active[b]:
+                    for i in range(int(order_conf.shape[0])):
+                        fixed = accepted_conf[b].clone()
+                        if i > 0:
+                            fixed[order_conf[:i]] = True
+                        cond_mask = fixed[:, None].repeat(1, action_dim)
+                        task_indices_conf[b].append(len(task_env_idx))
+                        task_env_idx.append(b)
+                        task_cond_tokens.append(draft_tokens[b])
+                        task_cond_mask.append(cond_mask)
+
+                if seq_active[b]:
+                    for i in range(int(order_seq.shape[0])):
+                        fixed = accepted_seq[b].clone()
+                        if i > 0:
+                            fixed[order_seq[:i]] = True
+                        cond_mask = fixed[:, None].repeat(1, action_dim)
+                        task_indices_seq[b].append(len(task_env_idx))
+                        task_env_idx.append(b)
+                        task_cond_tokens.append(draft_tokens[b])
+                        task_cond_mask.append(cond_mask)
+
+            if not task_env_idx:
+                continue
+
+            task_input_ids = input_ids[task_env_idx]
+            task_attention_mask = attention_mask[task_env_idx]
+            task_pixel_values = pixel_values[task_env_idx]
+            cond_action_tokens = torch.stack(task_cond_tokens, dim=0)
+            cond_action_mask = torch.stack(task_cond_mask, dim=0)
+
+            logits_tensor, _last_hidden_states = self._forward_action_logits(
+                task_input_ids,
+                task_attention_mask,
+                task_pixel_values,
+                n_prompt_tokens,
+                n_patches,
+                cond_action_tokens=cond_action_tokens,
+                cond_action_mask=cond_action_mask,
+            )
+
+            logits_tensor[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
+            logits_tensor[..., self.vocab_size :] = -torch.inf
+            idxs = logits_tensor.argmax(dim=-1)  # [num_tasks, act]
+            verify_tokens = idxs.reshape(-1, horizon, action_dim)
+
+            for b in range(batch_size):
+                if conf_active[b] and task_indices_conf[b]:
+                    order_conf = order_conf_list[b]
+                    verify_tokens_conf = verify_tokens[task_indices_conf[b]]
+                    for i in range(int(order_conf.shape[0])):
+                        pos = int(order_conf[i])
+                        pred = verify_tokens_conf[i, pos]
+                        draft = draft_tokens[b, pos]
+                        if torch.equal(pred, draft):
+                            accepted_conf[b, pos] = True
+                            accepted_rank_conf[b] += 1
+                            continue
+                        if fail_pos_conf[b] is None:
+                            fail_pos_conf[b] = pos
+                            fail_action_conf[b] = pred.detach().cpu()
+                        conf_active[b] = False
+                        conf_stop_prefix_len[b] = _prefix_len(accepted_conf[b])
+                        break
+
+                if seq_active[b] and task_indices_seq[b]:
+                    order_seq = order_seq_list[b]
+                    verify_tokens_seq = verify_tokens[task_indices_seq[b]]
+                    for i in range(int(order_seq.shape[0])):
+                        pos = int(order_seq[i])
+                        pred = verify_tokens_seq[i, pos]
+                        draft = draft_tokens[b, pos]
+                        if torch.equal(pred, draft):
+                            accepted_seq[b, pos] = True
+                            accepted_rank_seq[b] += 1
+                            continue
+                        if fail_pos_seq[b] is None:
+                            fail_pos_seq[b] = pos
+                            fail_action_seq[b] = pred.detach().cpu()
+                        seq_active[b] = False
+                        seq_stop_prefix_len[b] = _prefix_len(accepted_seq[b])
+                        break
+
+                if (
+                    seq_active[b]
+                    and conf_stop_prefix_len[b] is not None
+                    and _prefix_len(accepted_seq[b]) >= int(conf_stop_prefix_len[b])
+                ):
+                    seq_active[b] = False
+                if (
+                    conf_active[b]
+                    and seq_stop_prefix_len[b] is not None
+                    and _prefix_len(accepted_conf[b]) >= int(seq_stop_prefix_len[b])
+                ):
+                    conf_active[b] = False
+
+        accepted_prefix_len_conf = [
+            _prefix_len(accepted_conf[b]) for b in range(batch_size)
+        ]
+        accepted_prefix_len_seq = [
+            _prefix_len(accepted_seq[b]) for b in range(batch_size)
+        ]
+        accepted_prefix_len = [
+            int(min(accepted_prefix_len_conf[b], accepted_prefix_len_seq[b]))
+            for b in range(batch_size)
+        ]
+
+        append_pos_list = [-1] * batch_size
+        for b in range(batch_size):
+            append_action = None
+            append_pos = None
+            if accepted_prefix_len_conf[b] < accepted_prefix_len_seq[b]:
+                if (
+                    fail_pos_conf[b] is not None
+                    and int(fail_pos_conf[b]) == accepted_prefix_len[b]
+                ):
+                    append_action = fail_action_conf[b]
+                    append_pos = int(fail_pos_conf[b])
+            elif accepted_prefix_len_seq[b] < accepted_prefix_len_conf[b]:
+                if (
+                    fail_pos_seq[b] is not None
+                    and int(fail_pos_seq[b]) == accepted_prefix_len[b]
+                ):
+                    append_action = fail_action_seq[b]
+                    append_pos = int(fail_pos_seq[b])
+            else:
+                if (
+                    fail_pos_seq[b] is not None
+                    and int(fail_pos_seq[b]) == accepted_prefix_len[b]
+                ):
+                    append_action = fail_action_seq[b]
+                    append_pos = int(fail_pos_seq[b])
+                elif (
+                    fail_pos_conf[b] is not None
+                    and int(fail_pos_conf[b]) == accepted_prefix_len[b]
+                ):
+                    append_action = fail_action_conf[b]
+                    append_pos = int(fail_pos_conf[b])
+
+            if append_action is not None and append_pos is not None:
+                final_tokens[b, append_pos] = append_action.to(device=device)
+                append_pos_list[b] = int(append_pos)
+
+        info: dict[str, Any] = {
+            "accepted_prefix_len": accepted_prefix_len,
+            "accepted_prefix_len_conf": accepted_prefix_len_conf,
+            "accepted_prefix_len_seq": accepted_prefix_len_seq,
+            "accepted_rank_conf": accepted_rank_conf.detach().cpu().tolist(),
+            "accepted_rank_seq": accepted_rank_seq.detach().cpu().tolist(),
+            "spec_chunk_size": int(chunk_size),
+            "append_pos": append_pos_list,
+        }
+
+        return final_tokens, info
+
     @torch.no_grad()
     def predict_action_batch(
         self,
@@ -215,6 +571,22 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         **kwargs,
     ) -> tuple[np.ndarray, dict[str, Any]]:
         do_sample = kwargs.pop("do_sample")
+        spec_chunk_size = kwargs.pop("spec_chunk_size", None)
+        if spec_chunk_size is None:
+            spec_chunk_size = getattr(self.config, "spec_chunk_size", None)
+        if spec_chunk_size is not None:
+            spec_chunk_size = int(spec_chunk_size)
+            if spec_chunk_size <= 0:
+                spec_chunk_size = None
+        spec_enabled = kwargs.pop("spec_enabled", None)
+        if spec_enabled is None:
+            spec_enabled = getattr(self.config, "spec_enabled", None)
+        if spec_enabled is None:
+            spec_enabled = spec_chunk_size is not None
+        else:
+            spec_enabled = bool(spec_enabled)
+        if not spec_enabled:
+            spec_chunk_size = None
 
         if env_obs is not None:
             task_descriptions = [
@@ -303,50 +675,9 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             * self.vision_backbone.get_num_images_in_input()
         )
 
-        # llm inputs
-        input_ids, attention_mask = self._prepare_input_for_action_prediction(
-            input_ids, attention_mask
+        logits_tensor, last_hidden_states = self._forward_action_logits(
+            input_ids, attention_mask, pixel_values, n_prompt_tokens, n_patches
         )
-        assert torch.all(input_ids[:, -1] == STOP_INDEX)  # [B, L + act + 1, D]
-        assert torch.all(
-            attention_mask[:, -1 - self.action_dim * self.num_action_chunks :] == 1
-        )  # [B, L + act + 1]
-
-        # multimodal
-        mm_embeddings, mm_attention_mask = self._build_embedding(
-            input_ids, attention_mask, pixel_values
-        )
-        multimodal_position_ids = mm_attention_mask.cumsum(dim=1) - 1
-
-        # Forward pass through language model
-        outputs = self.language_model(
-            input_ids=None,
-            attention_mask=mm_attention_mask,
-            position_ids=multimodal_position_ids,
-            past_key_values=None,
-            inputs_embeds=mm_embeddings,
-            labels=None,
-            use_cache=None,
-            output_attentions=False,
-            output_hidden_states=True,
-            return_dict=True,
-        )
-
-        # Extract hidden states for action tokens
-        last_hidden_states = outputs.hidden_states[-1]  # (B, seq_len, D)
-        assert last_hidden_states.shape[1] == mm_embeddings.shape[1]
-
-        logits_tensor = outputs.logits[
-            :,
-            n_patches + n_prompt_tokens : n_patches
-            + n_prompt_tokens
-            + self.action_dim * self.num_action_chunks,
-            :,
-        ]  # [B, act, vocab_size + 64]
-
-        last_hidden_states = last_hidden_states[
-            :, -self.action_dim * self.num_action_chunks - 1 : -1
-        ]
 
         logits_tensor[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
         logits_tensor[..., self.vocab_size :] = -torch.inf
@@ -388,27 +719,33 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             idxs >= self.vocab_size - self.config.n_action_bins
         ) and torch.all(idxs < self.vocab_size)
 
-        chunk_action_tokens = idxs.reshape(-1, self.action_dim)
-        predicted_action_token_ids = chunk_action_tokens.cpu().numpy()
-        discretized_actions = self.vocab_size - predicted_action_token_ids
-        discretized_actions = np.clip(
-            discretized_actions - 1, a_min=0, a_max=self.bin_centers.shape[0] - 1
-        )
-        # normalized_actions = self.bin_centers[discretized_actions]
-        normalized_actions = np.asarray(
-            [self.bin_centers[da] for da in discretized_actions]
-        )  # [B, dim]
-        normalized_actions = normalized_actions.reshape(-1, self.action_dim)
-
-        # Unnormalize predicted actions
-        actions = self._unnormalize_actions(normalized_actions, self.unnorm_key)
+        action_tokens = idxs.reshape(-1, self.num_action_chunks, self.action_dim)
+        if spec_chunk_size is not None:
+            draft_logprobs = compute_logprobs_from_logits(
+                logits=processed_logits_tensor, target=idxs
+            ).reshape(-1, self.num_action_chunks, self.action_dim)
+            final_tokens, spec_info = self._speculative_verify_tokens(
+                draft_tokens=action_tokens,
+                draft_logprobs=draft_logprobs,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                pixel_values=pixel_values,
+                n_prompt_tokens=n_prompt_tokens,
+                n_patches=n_patches,
+                spec_chunk_size=spec_chunk_size,
+            )
+            action_tokens = final_tokens
+        actions = self._tokens_to_actions(action_tokens)
         actions = actions.reshape(idxs.shape)
 
         action_logits = processed_logits_tensor
         action_logits[..., : self.vocab_size - self.config.n_action_bins] = -torch.inf
         action_logits[..., self.vocab_size :] = -torch.inf
 
-        chunk_logprobs = compute_logprobs_from_logits(logits=action_logits, target=idxs)
+        final_token_flat = action_tokens.reshape(action_tokens.shape[0], -1)
+        chunk_logprobs = compute_logprobs_from_logits(
+            logits=action_logits, target=final_token_flat
+        )
 
         if hasattr(self, "value_head") and calculate_values:
             hidden_features = last_hidden_states[
@@ -420,7 +757,7 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
 
         chunk_actions = actions.reshape(-1, self.num_action_chunks, self.action_dim)
-        chunk_action_tokens = idxs.reshape(-1, self.num_action_chunks, self.action_dim)
+        chunk_action_tokens = action_tokens
 
         forward_inputs["action_tokens"] = chunk_action_tokens
 
@@ -429,6 +766,8 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             "prev_values": chunk_values,
             "forward_inputs": forward_inputs,
         }
+        if spec_chunk_size is not None:
+            result["spec_info"] = spec_info
 
         return chunk_actions, result
 

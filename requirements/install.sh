@@ -2,6 +2,9 @@
 
 set -euo pipefail
 
+export http_proxy=http://192.168.1.37:7897
+export https_proxy=http://192.168.1.37:7897
+
 TARGET=""
 
 MODEL=""

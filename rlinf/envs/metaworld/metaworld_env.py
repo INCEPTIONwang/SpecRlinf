@@ -102,7 +102,8 @@ class MetaWorldEnv(gym.Env):
         for env_fn_param in env_fn_params:
 
             def env_fn(param=env_fn_param):
-                os.environ["MUJOCO_EGL_DEVICE_ID"] = str(self.seed_offset)
+                if "MUJOCO_EGL_DEVICE_ID" not in os.environ:
+                    os.environ["MUJOCO_EGL_DEVICE_ID"] = "0"
                 env_name = param["env_name"]
                 env = gym.make(
                     "Meta-World/MT1",
@@ -238,6 +239,8 @@ class MetaWorldEnv(gym.Env):
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["task_id"] = self.task_ids.copy()
+        episode_info["trial_id"] = self.trial_ids.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 

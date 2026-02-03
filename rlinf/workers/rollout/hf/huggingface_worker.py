@@ -14,8 +14,11 @@
 
 import copy
 import gc
+import os
+from collections import deque
 from typing import Any
 
+import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
@@ -60,8 +63,18 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
+            spec_log_path = None
+            log_dir = self.cfg.runner.logger.get("log_path", None)
+            if log_dir:
+                spec_log_path = os.path.join(str(log_dir), "spec_debug.log")
+                if rollout_model_config.get("openpi") is None:
+                    rollout_model_config.openpi = {}
+                rollout_model_config.openpi.spec_log_path = spec_log_path
 
         self.hf_model = get_model(rollout_model_config)
+        self._spec_log_path = spec_log_path
+        if spec_log_path:
+            setattr(self.hf_model, "spec_log_path", spec_log_path)
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -72,6 +85,17 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _append_spec_log(self, line: str):
+        path = getattr(self, "_spec_log_path", None)
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+        except Exception:
+            return
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -319,21 +343,237 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        n_chunk_steps = (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
-        )
-        for _ in tqdm(
+        n_chunk_steps = int(self.cfg.env.eval.max_steps_per_rollout_epoch)
+        spec_accept_lengths = [None for _ in range(self.num_pipeline_stages)]
+        spec_reject_counts = [None for _ in range(self.num_pipeline_stages)]
+        spec_last_reject = [None for _ in range(self.num_pipeline_stages)]
+        spec_total_accept = 0
+        spec_total_chunks = 0
+        action_plans = [None for _ in range(self.num_pipeline_stages)]
+        pbar = tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
+        )
+
+        def _init_spec_buffers(stage_id: int, num_envs: int):
+            if spec_accept_lengths[stage_id] is not None and len(
+                spec_accept_lengths[stage_id]
+            ) == int(num_envs):
+                return
+            spec_accept_lengths[stage_id] = [[] for _ in range(num_envs)]
+            spec_reject_counts[stage_id] = [
+                {"conf": 0, "seq": 0} for _ in range(num_envs)
+            ]
+            spec_last_reject[stage_id] = [None for _ in range(num_envs)]
+
+        def _record_spec_info(
+            stage_id: int,
+            spec_info_list: list[dict[str, Any]],
+            env_indices: list[int] | None,
+            num_envs: int,
         ):
+            nonlocal spec_total_accept, spec_total_chunks
+            if not isinstance(spec_info_list, list) or not spec_info_list:
+                return
+            _init_spec_buffers(stage_id, num_envs)
+            if env_indices is None:
+                env_indices = list(range(len(spec_info_list)))
+            for local_idx, info in enumerate(spec_info_list):
+                if not info:
+                    continue
+                env_idx = int(env_indices[local_idx])
+                accept_len = info.get("accepted_prefix_len")
+                if accept_len is not None:
+                    spec_accept_lengths[stage_id][env_idx].append(int(accept_len))
+                    spec_total_accept += int(accept_len)
+                    spec_total_chunks += 1
+                reject = info.get("reject")
+                if isinstance(reject, dict):
+                    kind = reject.get("kind")
+                    if kind in ("conf", "seq"):
+                        spec_reject_counts[stage_id][env_idx][kind] += 1
+                    spec_last_reject[stage_id][env_idx] = reject
+
+        def _ensure_action_plans(stage_id: int, num_envs: int):
+            if action_plans[stage_id] is not None and len(
+                action_plans[stage_id]
+            ) == int(num_envs):
+                return
+            action_plans[stage_id] = [deque() for _ in range(num_envs)]
+
+        def _slice_env_obs(env_obs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+            sliced: dict[str, Any] = {}
+            for key, value in env_obs.items():
+                if torch.is_tensor(value):
+                    sliced[key] = value[indices]
+                elif isinstance(value, list):
+                    sliced[key] = [value[i] for i in indices]
+                elif isinstance(value, dict):
+                    sliced[key] = _slice_env_obs(value, indices)
+                else:
+                    sliced[key] = value
+            return sliced
+
+        def _clear_plans_on_done(stage_id: int, env_output: dict[str, Any]):
+            if action_plans[stage_id] is None:
+                return
+            dones = env_output.get("dones")
+            if dones is None:
+                return
+            if torch.is_tensor(dones):
+                done_mask = dones[:, -1] if dones.ndim > 1 else dones
+                done_mask = done_mask.bool().cpu().numpy()
+            else:
+                done_arr = np.asarray(dones)
+                done_mask = done_arr[:, -1] if done_arr.ndim > 1 else done_arr
+                done_mask = done_mask.astype(bool)
+            for env_idx in np.flatnonzero(done_mask):
+                action_plans[stage_id][int(env_idx)].clear()
+
+        def _log_eval_info(stage_id: int, eval_info: list[dict[str, Any] | None]):
+            if not isinstance(eval_info, list) or not eval_info or pbar.disable:
+                return
+            items = [info for info in eval_info if info]
+            for env_idx, info in enumerate(eval_info):
+                if not info:
+                    continue
+                eval_line = (
+                    "metaworld_eval episode={episode} task_id={task_id} task={task} "
+                    "desc={desc} difficulty={difficulty} trial_id={trial_id} "
+                    "success={success} return={return:.4f} episode_len={episode_len}".format(
+                        **info
+                    )
+                )
+                self._append_spec_log(eval_line)
+                if spec_accept_lengths[stage_id] is None:
+                    continue
+                accept_list = spec_accept_lengths[stage_id][env_idx]
+                if accept_list:
+                    avg_accept = float(sum(accept_list)) / float(len(accept_list))
+                    counts = spec_reject_counts[stage_id][env_idx]
+                    global_avg = (
+                        float(spec_total_accept) / float(spec_total_chunks)
+                        if spec_total_chunks > 0
+                        else float("nan")
+                    )
+                    last_reject = spec_last_reject[stage_id][env_idx]
+                    reject_msg = "none"
+                    if isinstance(last_reject, dict):
+                        reject_kind = last_reject.get("kind", "unknown")
+                        reject_pos = last_reject.get("pos", -1)
+                        reject_max = last_reject.get("abs_diff_max", float("nan"))
+                        reject_over = last_reject.get("over_dims")
+                        reject_msg = (
+                            f"{reject_kind}@{reject_pos} max_diff={reject_max:.4f} "
+                            f"over={reject_over}"
+                        )
+                    spec_line = (
+                        "metaworld_spec episode={episode} accepted_len_avg={avg:.3f} "
+                        "chunks={chunks} reject_conf={rej_conf} reject_seq={rej_seq} "
+                        "global_avg={global_avg:.3f} last_reject={last_reject}".format(
+                            episode=int(info["episode"]),
+                            avg=avg_accept,
+                            chunks=len(accept_list),
+                            rej_conf=counts.get("conf", 0),
+                            rej_seq=counts.get("seq", 0),
+                            global_avg=global_avg,
+                            last_reject=reject_msg,
+                        )
+                    )
+                    self._append_spec_log(spec_line)
+                    spec_accept_lengths[stage_id][env_idx] = []
+                    spec_reject_counts[stage_id][env_idx] = {"conf": 0, "seq": 0}
+                    spec_last_reject[stage_id][env_idx] = None
+            if items:
+                last = items[-1]
+                pbar.set_postfix(
+                    task=last["task"],
+                    success=last["success"],
+                    diff=last["difficulty"],
+                )
+
+        for _ in pbar:
+            action_plans = [None for _ in range(self.num_pipeline_stages)]
             for _ in range(n_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    eval_info = env_output.get("eval_info")
+                    _log_eval_info(stage_id, eval_info)
                     extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                    actions, _ = self.predict(extracted_obs, mode="eval")
-                    self.send_chunk_actions(output_channel, actions, mode="eval")
+                    num_envs = 0
+                    for value in extracted_obs.values():
+                        if torch.is_tensor(value):
+                            num_envs = int(value.shape[0])
+                            break
+                        if isinstance(value, list):
+                            num_envs = len(value)
+                            break
+                    _ensure_action_plans(stage_id, num_envs)
+                    _clear_plans_on_done(stage_id, env_output)
+
+                    need_plan = [
+                        idx
+                        for idx, plan in enumerate(action_plans[stage_id])
+                        if not plan
+                    ]
+                    actions_new = None
+                    spec_info_list = None
+                    if need_plan:
+                        sliced_obs = _slice_env_obs(extracted_obs, need_plan)
+                        actions_new, result = self.predict(sliced_obs, mode="eval")
+                        if torch.is_tensor(actions_new):
+                            actions_new = actions_new.cpu().numpy()
+                        spec_info_list = (
+                            result.get("spec_info") if isinstance(result, dict) else None
+                        )
+                        if isinstance(spec_info_list, list):
+                            _record_spec_info(
+                                stage_id, spec_info_list, need_plan, num_envs
+                            )
+                        for local_idx, env_idx in enumerate(need_plan):
+                            plan_actions = None
+                            if isinstance(spec_info_list, list) and local_idx < len(
+                                spec_info_list
+                            ):
+                                info = spec_info_list[local_idx]
+                                if isinstance(info, dict):
+                                    accepted_actions = info.get("accepted_actions")
+                                    if accepted_actions is not None:
+                                        plan_actions = np.asarray(accepted_actions)
+                            if plan_actions is None and actions_new is not None:
+                                plan_actions = np.asarray(actions_new[local_idx])
+                            if plan_actions is None:
+                                continue
+                            if plan_actions.ndim == 1:
+                                plan_actions = plan_actions[None, ...]
+                            for step_action in plan_actions:
+                                action_plans[stage_id][env_idx].append(
+                                    np.asarray(step_action, dtype=np.float32)
+                                )
+
+                    step_actions = []
+                    for env_idx in range(num_envs):
+                        plan = action_plans[stage_id][env_idx]
+                        if plan:
+                            step_actions.append(
+                                np.asarray(plan.popleft(), dtype=np.float32)
+                            )
+                        else:
+                            step_actions.append(
+                                np.zeros(
+                                    (self.cfg.actor.model.action_dim,),
+                                    dtype=np.float32,
+                                )
+                            )
+                    actions_to_send = np.stack(step_actions, axis=0)[:, None, :]
+                    self.send_chunk_actions(output_channel, actions_to_send, mode="eval")
+            for stage_id in range(self.num_pipeline_stages):
+                env_output = await self.recv_env_output(input_channel, mode="eval")
+                eval_info = env_output.get("eval_info")
+                _log_eval_info(stage_id, eval_info)
+                _clear_plans_on_done(stage_id, env_output)
+        pbar.close()
 
         if self.enable_offload:
             self.offload_model()

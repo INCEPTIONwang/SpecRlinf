@@ -29,6 +29,9 @@ class MetaWorldBenchmark:
             config_path, "TASK_DESCRIPTIONS"
         )
         self.ML45_dict = load_prompt_from_json(config_path, "ML45")
+        self.difficulty_to_tasks = load_prompt_from_json(
+            config_path, "DIFFICULTY_TO_TASKS"
+        )
 
     def get_num_tasks(self):
         if self.task_suite_name == "metaworld_50":
@@ -59,3 +62,10 @@ class MetaWorldBenchmark:
         for env_name in self.get_env_names():
             task_descriptions.append(self.task_description_dict[env_name])
         return task_descriptions
+
+    def get_task_difficulty_map(self) -> dict[str, str]:
+        difficulty_map: dict[str, str] = {}
+        for difficulty, tasks in self.difficulty_to_tasks.items():
+            for task in tasks:
+                difficulty_map[task] = difficulty
+        return difficulty_map

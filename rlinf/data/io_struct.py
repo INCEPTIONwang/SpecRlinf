@@ -1167,6 +1167,7 @@ class EnvOutput:
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
+    eval_info: Optional[list[Optional[dict[str, Any]]]] = None  # eval-only, per-episode info
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -1237,6 +1238,7 @@ class EnvOutput:
         env_output_dict["rewards"] = self.rewards
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["eval_info"] = self.eval_info
 
         return env_output_dict
 
