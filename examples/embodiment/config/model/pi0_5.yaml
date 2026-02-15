@@ -32,3 +32,6 @@ openpi:
   value_after_vlm: False
   value_vlm_mode: "mean_token"
   detach_critic_input: null
+  # speculative verify switches (eval-only)
+  spec_verify_conf: True
+  spec_verify_seq: True
