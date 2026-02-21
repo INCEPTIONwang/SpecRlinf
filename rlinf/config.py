@@ -731,12 +731,16 @@ def validate_embodied_cfg(cfg):
         ), (
             "env.eval.total_num_envs // env_world_size // rollout.pipeline_stage_num must be divisible by the group size"
         )
-        assert (
+        if (
             cfg.env.eval.max_steps_per_rollout_epoch % cfg.actor.model.num_action_chunks
-            == 0
-        ), (
-            "env.eval.max_steps_per_rollout_epoch must be divisible by actor.model.num_action_chunks"
-        )
+            != 0
+        ):
+            logging.warning(
+                "env.eval.max_steps_per_rollout_epoch (%d) is not divisible by "
+                "actor.model.num_action_chunks (%d). The last chunk will be truncated.",
+                cfg.env.eval.max_steps_per_rollout_epoch,
+                cfg.actor.model.num_action_chunks,
+            )
 
     if not cfg.runner.only_eval:
         assert cfg.env.train.total_num_envs > 0, (

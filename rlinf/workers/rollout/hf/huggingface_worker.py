@@ -14,8 +14,13 @@
 
 import copy
 import gc
+import json
+import os
+from collections import deque
+import fcntl
 from typing import Any
 
+import numpy as np
 import torch
 from omegaconf import DictConfig, OmegaConf, open_dict
 from tqdm import tqdm
@@ -60,8 +65,21 @@ class MultiStepRolloutWorker(Worker):
         with open_dict(rollout_model_config):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
+            spec_log_path = None
+            spec_global_stats_path = None
+            log_dir = self.cfg.runner.logger.get("log_path", None)
+            if log_dir:
+                spec_log_path = os.path.join(str(log_dir), "spec_debug.log")
+                spec_global_stats_path = os.path.join(str(log_dir), "spec_global_stats.json")
+                if rollout_model_config.get("openpi") is None:
+                    rollout_model_config.openpi = {}
+                rollout_model_config.openpi.spec_log_path = spec_log_path
 
         self.hf_model = get_model(rollout_model_config)
+        self._spec_log_path = spec_log_path
+        self._spec_global_stats_path = spec_global_stats_path
+        if spec_log_path:
+            setattr(self.hf_model, "spec_log_path", spec_log_path)
 
         if self.cfg.runner.get("ckpt_path", None):
             model_dict = torch.load(self.cfg.runner.ckpt_path)
@@ -72,6 +90,126 @@ class MultiStepRolloutWorker(Worker):
         self.setup_sample_params()
         if self.enable_offload:
             self.offload_model()
+
+    def _append_spec_log(self, line: str):
+        path = getattr(self, "_spec_log_path", None)
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+        except Exception:
+            return
+
+    def _default_spec_global_stats(self) -> dict[str, Any]:
+        return {
+            "total_accept": 0,
+            "total_exec_accept": 0,
+            "total_chunks": 0,
+            "global_avg": 0.0,
+            "global_exec_avg": 0.0,
+            "reject_dim_counts": [],
+        }
+
+    def _normalize_over_dims(self, over_dims: Any) -> list[int]:
+        if not isinstance(over_dims, (list, tuple, np.ndarray)):
+            return []
+        try:
+            return [int(v) for v in list(over_dims)]
+        except Exception:
+            return []
+
+    def _finalize_spec_global_stats(self, stats: dict[str, Any]) -> dict[str, Any]:
+        total_chunks = int(stats.get("total_chunks", 0))
+        if total_chunks > 0:
+            stats["global_avg"] = float(stats.get("total_accept", 0)) / float(total_chunks)
+            stats["global_exec_avg"] = float(stats.get("total_exec_accept", 0)) / float(total_chunks)
+        else:
+            stats["global_avg"] = 0.0
+            stats["global_exec_avg"] = 0.0
+        return stats
+
+    def _load_spec_global_stats_unlocked(self, path: str) -> dict[str, Any]:
+        stats = self._default_spec_global_stats()
+        if not os.path.exists(path):
+            return stats
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            if not isinstance(payload, dict):
+                return stats
+            stats["total_accept"] = int(payload.get("total_accept", 0))
+            stats["total_exec_accept"] = int(payload.get("total_exec_accept", 0))
+            stats["total_chunks"] = int(payload.get("total_chunks", 0))
+            if "global_avg" in payload:
+                stats["global_avg"] = float(payload.get("global_avg", 0.0))
+            if "global_exec_avg" in payload:
+                stats["global_exec_avg"] = float(payload.get("global_exec_avg", 0.0))
+            reject_dims = payload.get("reject_dim_counts", [])
+            if isinstance(reject_dims, list):
+                stats["reject_dim_counts"] = [int(v) for v in reject_dims]
+            return self._finalize_spec_global_stats(stats)
+        except Exception:
+            return stats
+
+    def _save_spec_global_stats_unlocked(self, path: str, stats: dict[str, Any]):
+        stats = self._finalize_spec_global_stats(dict(stats))
+        tmp_path = f"{path}.tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(stats, f, ensure_ascii=True)
+        os.replace(tmp_path, path)
+
+    def _update_spec_global_stats(
+        self,
+        *,
+        accept_len: int | None = None,
+        exec_len: int | None = None,
+        over_dims: Any = None,
+    ) -> dict[str, Any]:
+        path = getattr(self, "_spec_global_stats_path", None)
+        if not path:
+            return self._default_spec_global_stats()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            lock_path = f"{path}.lock"
+            with open(lock_path, "a+", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                stats = self._load_spec_global_stats_unlocked(path)
+                if accept_len is not None:
+                    stats["total_accept"] += int(accept_len)
+                    if exec_len is None:
+                        stats["total_exec_accept"] += int(accept_len)
+                    else:
+                        stats["total_exec_accept"] += int(exec_len)
+                    stats["total_chunks"] += 1
+                dims = self._normalize_over_dims(over_dims)
+                if dims:
+                    counts = stats["reject_dim_counts"]
+                    if len(counts) < len(dims):
+                        counts.extend([0] * (len(dims) - len(counts)))
+                    for dim_idx, dim_value in enumerate(dims):
+                        counts[dim_idx] += int(dim_value)
+                self._save_spec_global_stats_unlocked(path, stats)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                return stats
+        except Exception:
+            return self._default_spec_global_stats()
+
+    def _read_spec_global_stats(self) -> dict[str, Any]:
+        path = getattr(self, "_spec_global_stats_path", None)
+        if not path:
+            return self._default_spec_global_stats()
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            lock_path = f"{path}.lock"
+            with open(lock_path, "a+", encoding="utf-8") as lock_f:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_SH)
+                stats = self._load_spec_global_stats_unlocked(path)
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+                return stats
+        except Exception:
+            return self._default_spec_global_stats()
 
     def setup_sample_params(self):
         # length parameters for rollout
@@ -109,13 +247,16 @@ class MultiStepRolloutWorker(Worker):
             else self._eval_sampling_params
         )
 
-        if SupportedModel(self.cfg.actor.model.model_type) in [
+        model_type = SupportedModel(self.cfg.actor.model.model_type)
+        if model_type in [
             SupportedModel.OPENPI,
             SupportedModel.MLP_POLICY,
             SupportedModel.GR00T,
             SupportedModel.CNN_POLICY,
         ]:
             kwargs = {"mode": mode}
+        elif model_type == SupportedModel.OPENVLA_OFT:
+            kwargs["mode"] = mode
 
         kwargs["return_obs"] = not hasattr(self.hf_model, "q_head")
 
@@ -319,21 +460,488 @@ class MultiStepRolloutWorker(Worker):
         if self.enable_offload:
             self.reload_model()
 
-        n_chunk_steps = (
-            self.cfg.env.eval.max_steps_per_rollout_epoch
-            // self.cfg.actor.model.num_action_chunks
-        )
-        for _ in tqdm(
+        n_chunk_steps = int(self.cfg.env.eval.max_steps_per_rollout_epoch)
+        spec_accept_lengths = [None for _ in range(self.num_pipeline_stages)]
+        spec_accept_exec_lengths = [None for _ in range(self.num_pipeline_stages)]
+        spec_reject_counts = [None for _ in range(self.num_pipeline_stages)]
+        spec_reject_dim_counts = [None for _ in range(self.num_pipeline_stages)]
+        spec_last_reject = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_mu_abs_means = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_var_means = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_var_maxes = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_mu_abs_mean_dims = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_var_mean_dims = [None for _ in range(self.num_pipeline_stages)]
+        spec_conf_var_max_dims = [None for _ in range(self.num_pipeline_stages)]
+        spec_verify_conf_flags = [None for _ in range(self.num_pipeline_stages)]
+        spec_verify_seq_flags = [None for _ in range(self.num_pipeline_stages)]
+        spec_total_accept = 0
+        spec_total_exec_accept = 0
+        spec_total_chunks = 0
+        spec_total_reject_dim_counts: list[int] = []
+        action_plans = [None for _ in range(self.num_pipeline_stages)]
+        pbar = tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
             desc="Evaluating Rollout Epochs",
             disable=(self._rank != 0),
+        )
+
+        def _accumulate_reject_dims(counts: list[int], over_dims: Any) -> list[int]:
+            if not isinstance(over_dims, (list, tuple, np.ndarray)):
+                return counts
+            try:
+                dims = [int(v) for v in list(over_dims)]
+            except Exception:
+                return counts
+            if len(counts) < len(dims):
+                counts.extend([0] * (len(dims) - len(counts)))
+            for dim_idx, dim_value in enumerate(dims):
+                counts[dim_idx] += int(dim_value)
+            return counts
+
+        def _normalize_float_dims(values: Any) -> list[float]:
+            if not isinstance(values, (list, tuple, np.ndarray)):
+                return []
+            out: list[float] = []
+            for v in list(values):
+                try:
+                    out.append(float(v))
+                except Exception:
+                    continue
+            return out
+
+        def _mean_dim_vectors(vectors: list[list[float]]) -> list[float]:
+            if not vectors:
+                return []
+            max_len = max((len(v) for v in vectors), default=0)
+            if max_len == 0:
+                return []
+            sums = [0.0] * max_len
+            counts = [0] * max_len
+            for vec in vectors:
+                for dim_idx, value in enumerate(vec):
+                    sums[dim_idx] += float(value)
+                    counts[dim_idx] += 1
+            return [
+                (sums[dim_idx] / counts[dim_idx]) if counts[dim_idx] > 0 else float("nan")
+                for dim_idx in range(max_len)
+            ]
+
+        def _max_dim_vectors(vectors: list[list[float]]) -> list[float]:
+            if not vectors:
+                return []
+            max_len = max((len(v) for v in vectors), default=0)
+            if max_len == 0:
+                return []
+            out = [float("-inf")] * max_len
+            seen = [False] * max_len
+            for vec in vectors:
+                for dim_idx, value in enumerate(vec):
+                    v = float(value)
+                    if (not seen[dim_idx]) or v > out[dim_idx]:
+                        out[dim_idx] = v
+                        seen[dim_idx] = True
+            return [out[dim_idx] if seen[dim_idx] else float("nan") for dim_idx in range(max_len)]
+
+        def _fmt_float_list(values: list[float], digits: int = 6) -> list[float]:
+            return [round(float(v), digits) for v in values]
+
+        def _init_spec_buffers(stage_id: int, num_envs: int):
+            if spec_accept_lengths[stage_id] is not None and len(
+                spec_accept_lengths[stage_id]
+            ) == int(num_envs):
+                return
+            spec_accept_lengths[stage_id] = [[] for _ in range(num_envs)]
+            spec_accept_exec_lengths[stage_id] = [[] for _ in range(num_envs)]
+            spec_reject_counts[stage_id] = [
+                {"conf": 0, "seq": 0} for _ in range(num_envs)
+            ]
+            spec_reject_dim_counts[stage_id] = [[] for _ in range(num_envs)]
+            spec_last_reject[stage_id] = [None for _ in range(num_envs)]
+            spec_conf_mu_abs_means[stage_id] = [[] for _ in range(num_envs)]
+            spec_conf_var_means[stage_id] = [[] for _ in range(num_envs)]
+            spec_conf_var_maxes[stage_id] = [[] for _ in range(num_envs)]
+            spec_conf_mu_abs_mean_dims[stage_id] = [[] for _ in range(num_envs)]
+            spec_conf_var_mean_dims[stage_id] = [[] for _ in range(num_envs)]
+            spec_conf_var_max_dims[stage_id] = [[] for _ in range(num_envs)]
+            spec_verify_conf_flags[stage_id] = [None for _ in range(num_envs)]
+            spec_verify_seq_flags[stage_id] = [None for _ in range(num_envs)]
+
+        def _record_spec_info(
+            stage_id: int,
+            spec_info_list: list[dict[str, Any]],
+            env_indices: list[int] | None,
+            num_envs: int,
+            countable_mask: np.ndarray | list[bool] | None = None,
         ):
+            nonlocal spec_total_accept, spec_total_chunks
+            nonlocal spec_total_exec_accept, spec_total_reject_dim_counts
+            if not isinstance(spec_info_list, list) or not spec_info_list:
+                return
+            _init_spec_buffers(stage_id, num_envs)
+            if env_indices is None:
+                env_indices = list(range(len(spec_info_list)))
+            for local_idx, info in enumerate(spec_info_list):
+                if not info:
+                    continue
+                env_idx = int(env_indices[local_idx])
+                should_count_global = True
+                if countable_mask is not None:
+                    try:
+                        if 0 <= env_idx < len(countable_mask):
+                            should_count_global = bool(countable_mask[env_idx])
+                    except Exception:
+                        should_count_global = True
+                accept_len = info.get("accepted_prefix_len")
+                exec_len = info.get("accepted_exec_len", accept_len)
+                if accept_len is not None:
+                    spec_accept_lengths[stage_id][env_idx].append(int(accept_len))
+                    if exec_len is not None:
+                        spec_accept_exec_lengths[stage_id][env_idx].append(int(exec_len))
+                    spec_total_accept += int(accept_len)
+                    if exec_len is not None:
+                        spec_total_exec_accept += int(exec_len)
+                    spec_total_chunks += 1
+                conf_stats = info.get("conf_stats")
+                if isinstance(conf_stats, dict):
+                    mu_abs_mean = conf_stats.get("mu_abs_mean")
+                    var_mean = conf_stats.get("var_mean")
+                    var_max = conf_stats.get("var_max")
+                    if mu_abs_mean is not None:
+                        spec_conf_mu_abs_means[stage_id][env_idx].append(float(mu_abs_mean))
+                    if var_mean is not None:
+                        spec_conf_var_means[stage_id][env_idx].append(float(var_mean))
+                    if var_max is not None:
+                        spec_conf_var_maxes[stage_id][env_idx].append(float(var_max))
+                    mu_abs_mean_dim = _normalize_float_dims(conf_stats.get("mu_abs_mean_dim"))
+                    var_mean_dim = _normalize_float_dims(conf_stats.get("var_mean_dim"))
+                    var_max_dim = _normalize_float_dims(conf_stats.get("var_max_dim"))
+                    if mu_abs_mean_dim:
+                        spec_conf_mu_abs_mean_dims[stage_id][env_idx].append(mu_abs_mean_dim)
+                    if var_mean_dim:
+                        spec_conf_var_mean_dims[stage_id][env_idx].append(var_mean_dim)
+                    if var_max_dim:
+                        spec_conf_var_max_dims[stage_id][env_idx].append(var_max_dim)
+
+                verify_conf = info.get("spec_verify_conf")
+                verify_seq = info.get("spec_verify_seq")
+                if verify_conf is not None:
+                    spec_verify_conf_flags[stage_id][env_idx] = bool(verify_conf)
+                if verify_seq is not None:
+                    spec_verify_seq_flags[stage_id][env_idx] = bool(verify_seq)
+
+                reject = info.get("reject")
+                over_dims = None
+                if isinstance(reject, dict):
+                    kind = reject.get("kind")
+                    if kind in ("conf", "seq"):
+                        spec_reject_counts[stage_id][env_idx][kind] += 1
+                    over_dims = reject.get("over_dims")
+                    spec_reject_dim_counts[stage_id][env_idx] = _accumulate_reject_dims(
+                        spec_reject_dim_counts[stage_id][env_idx], over_dims
+                    )
+                    spec_total_reject_dim_counts = _accumulate_reject_dims(
+                        spec_total_reject_dim_counts, over_dims
+                    )
+                    spec_last_reject[stage_id][env_idx] = reject
+                if should_count_global and (accept_len is not None or over_dims is not None):
+                    self._update_spec_global_stats(
+                        accept_len=accept_len,
+                        exec_len=exec_len,
+                        over_dims=over_dims,
+                    )
+
+        def _ensure_action_plans(stage_id: int, num_envs: int):
+            if action_plans[stage_id] is not None and len(
+                action_plans[stage_id]
+            ) == int(num_envs):
+                return
+            action_plans[stage_id] = [deque() for _ in range(num_envs)]
+
+        def _slice_env_obs(env_obs: dict[str, Any], indices: list[int]) -> dict[str, Any]:
+            sliced: dict[str, Any] = {}
+            for key, value in env_obs.items():
+                if torch.is_tensor(value):
+                    sliced[key] = value[indices]
+                elif isinstance(value, list):
+                    sliced[key] = [value[i] for i in indices]
+                elif isinstance(value, dict):
+                    sliced[key] = _slice_env_obs(value, indices)
+                else:
+                    sliced[key] = value
+            return sliced
+
+        def _clear_plans_on_done(stage_id: int, env_output: dict[str, Any]):
+            if action_plans[stage_id] is None:
+                return
+            dones = env_output.get("dones")
+            if dones is None:
+                return
+            if torch.is_tensor(dones):
+                done_mask = dones[:, -1] if dones.ndim > 1 else dones
+                done_mask = done_mask.bool().cpu().numpy()
+            else:
+                done_arr = np.asarray(dones)
+                done_mask = done_arr[:, -1] if done_arr.ndim > 1 else done_arr
+                done_mask = done_mask.astype(bool)
+            for env_idx in np.flatnonzero(done_mask):
+                action_plans[stage_id][int(env_idx)].clear()
+
+        def _log_eval_info(stage_id: int, eval_info: list[dict[str, Any] | None]):
+            if not isinstance(eval_info, list) or not eval_info:
+                return
+            env_type = getattr(self.cfg.env.eval, "env_type", "env")
+            is_metaworld = env_type == "metaworld"
+            items = [info for info in eval_info if info]
+            for env_idx, info in enumerate(eval_info):
+                if not info:
+                    continue
+                if is_metaworld:
+                    eval_line = (
+                        "metaworld_eval episode={episode} task_id={task_id} task={task} "
+                        "desc={desc} difficulty={difficulty} trial_id={trial_id} "
+                        "success={success} return={return:.4f} episode_len={episode_len}".format(
+                            **info
+                        )
+                    )
+                else:
+                    eval_line = (
+                        f"{env_type}_eval episode={info.get('episode')} "
+                        f"task_id={info.get('task_id', -1)} "
+                        f"trial_id={info.get('trial_id', -1)} "
+                        f"reset_state_id={info.get('reset_state_id', -1)} "
+                        f"success={info.get('success')} "
+                        f"return={float(info.get('return', float('nan'))):.4f} "
+                        f"episode_len={info.get('episode_len', -1)}"
+                    )
+                self._append_spec_log(eval_line)
+                if spec_accept_lengths[stage_id] is None:
+                    continue
+                accept_list = spec_accept_lengths[stage_id][env_idx]
+                accept_exec_list = spec_accept_exec_lengths[stage_id][env_idx]
+                if accept_list:
+                    avg_accept = float(sum(accept_list)) / float(len(accept_list))
+                    avg_exec_accept = (
+                        float(sum(accept_exec_list)) / float(len(accept_exec_list))
+                        if accept_exec_list
+                        else avg_accept
+                    )
+                    counts = spec_reject_counts[stage_id][env_idx]
+                    reject_dims = list(spec_reject_dim_counts[stage_id][env_idx])
+                    local_global_reject_dims = list(spec_total_reject_dim_counts)
+                    conf_mu_abs_mean_list = spec_conf_mu_abs_means[stage_id][env_idx]
+                    conf_var_mean_list = spec_conf_var_means[stage_id][env_idx]
+                    conf_var_max_list = spec_conf_var_maxes[stage_id][env_idx]
+                    conf_mu_abs_mean_dim_list = spec_conf_mu_abs_mean_dims[stage_id][env_idx]
+                    conf_var_mean_dim_list = spec_conf_var_mean_dims[stage_id][env_idx]
+                    conf_var_max_dim_list = spec_conf_var_max_dims[stage_id][env_idx]
+                    conf_mu_abs_mean = (
+                        float(sum(conf_mu_abs_mean_list)) / float(len(conf_mu_abs_mean_list))
+                        if conf_mu_abs_mean_list
+                        else float("nan")
+                    )
+                    conf_var_mean = (
+                        float(sum(conf_var_mean_list)) / float(len(conf_var_mean_list))
+                        if conf_var_mean_list
+                        else float("nan")
+                    )
+                    conf_var_max = (
+                        float(max(conf_var_max_list))
+                        if conf_var_max_list
+                        else float("nan")
+                    )
+                    conf_mu_abs_mean_dim = _mean_dim_vectors(conf_mu_abs_mean_dim_list)
+                    conf_var_mean_dim = _mean_dim_vectors(conf_var_mean_dim_list)
+                    conf_var_max_dim = _max_dim_vectors(conf_var_max_dim_list)
+                    local_global_avg = (
+                        float(spec_total_accept) / float(spec_total_chunks)
+                        if spec_total_chunks > 0
+                        else float("nan")
+                    )
+                    local_global_exec_avg = (
+                        float(spec_total_exec_accept) / float(spec_total_chunks)
+                        if spec_total_chunks > 0
+                        else float("nan")
+                    )
+                    shared_global = self._read_spec_global_stats()
+                    shared_total_chunks = int(shared_global.get("total_chunks", 0))
+                    if shared_total_chunks > 0:
+                        global_avg = float(shared_global.get("global_avg", 0.0))
+                        global_exec_avg = float(shared_global.get("global_exec_avg", 0.0))
+                        global_reject_dims = list(shared_global.get("reject_dim_counts", []))
+                    else:
+                        global_avg = local_global_avg
+                        global_exec_avg = local_global_exec_avg
+                        global_reject_dims = local_global_reject_dims
+                    last_reject = spec_last_reject[stage_id][env_idx]
+                    reject_msg = "none"
+                    if isinstance(last_reject, dict):
+                        reject_kind = last_reject.get("kind", "unknown")
+                        reject_pos = last_reject.get("pos", -1)
+                        reject_max = last_reject.get("abs_diff_max", float("nan"))
+                        reject_over = last_reject.get("over_dims")
+                        reject_msg = (
+                            f"{reject_kind}@{reject_pos} max_diff={reject_max:.4f} "
+                            f"over={reject_over}"
+                        )
+                    verify_conf = spec_verify_conf_flags[stage_id][env_idx]
+                    verify_seq = spec_verify_seq_flags[stage_id][env_idx]
+                    if verify_conf is None:
+                        verify_conf = True
+                    if verify_seq is None:
+                        verify_seq = True
+
+                    prefix = "metaworld" if is_metaworld else env_type
+                    spec_line = (
+                        f"{prefix}_spec episode={int(info['episode'])} "
+                        f"verify_conf={int(bool(verify_conf))} verify_seq={int(bool(verify_seq))} "
+                        f"accepted_len_avg={avg_accept:.3f} "
+                        f"accepted_exec_len_avg={avg_exec_accept:.3f} "
+                        f"chunks={len(accept_list)} reject_conf={counts.get('conf', 0)} "
+                        f"reject_seq={counts.get('seq', 0)} global_avg={global_avg:.3f} "
+                        f"global_exec_avg={global_exec_avg:.3f} global_chunks={shared_total_chunks} "
+                        f"global_accept_total={int(shared_global.get('total_accept', 0))} "
+                        f"global_exec_total={int(shared_global.get('total_exec_accept', 0))} "
+                        f"conf_mu_abs_mean={conf_mu_abs_mean:.6f} "
+                        f"conf_var_mean={conf_var_mean:.6f} conf_var_max={conf_var_max:.6f} "
+                        f"conf_mu_abs_mean_dim={_fmt_float_list(conf_mu_abs_mean_dim)} "
+                        f"conf_var_mean_dim={_fmt_float_list(conf_var_mean_dim)} "
+                        f"conf_var_max_dim={_fmt_float_list(conf_var_max_dim)} "
+                        f"reject_dims={reject_dims} global_reject_dims={global_reject_dims} "
+                        f"last_reject={reject_msg}"
+                    )
+                    self._append_spec_log(spec_line)
+                    spec_accept_lengths[stage_id][env_idx] = []
+                    spec_accept_exec_lengths[stage_id][env_idx] = []
+                    spec_reject_counts[stage_id][env_idx] = {"conf": 0, "seq": 0}
+                    spec_reject_dim_counts[stage_id][env_idx] = []
+                    spec_last_reject[stage_id][env_idx] = None
+                    spec_conf_mu_abs_means[stage_id][env_idx] = []
+                    spec_conf_var_means[stage_id][env_idx] = []
+                    spec_conf_var_maxes[stage_id][env_idx] = []
+                    spec_conf_mu_abs_mean_dims[stage_id][env_idx] = []
+                    spec_conf_var_mean_dims[stage_id][env_idx] = []
+                    spec_conf_var_max_dims[stage_id][env_idx] = []
+                    spec_verify_conf_flags[stage_id][env_idx] = None
+                    spec_verify_seq_flags[stage_id][env_idx] = None
+            if items:
+                last = items[-1]
+                if is_metaworld:
+                    pbar.set_postfix(
+                        task=last["task"],
+                        success=last["success"],
+                        diff=last["difficulty"],
+                    )
+                else:
+                    pbar.set_postfix(
+                        task_id=last.get("task_id", -1),
+                        success=last.get("success"),
+                    )
+
+        for _ in pbar:
+            action_plans = [None for _ in range(self.num_pipeline_stages)]
             for _ in range(n_chunk_steps):
-                for _ in range(self.num_pipeline_stages):
+                for stage_id in range(self.num_pipeline_stages):
                     env_output = await self.recv_env_output(input_channel, mode="eval")
+                    eval_info = env_output.get("eval_info")
+                    _log_eval_info(stage_id, eval_info)
                     extracted_obs = self.hf_model.preprocess_env_obs(env_output["obs"])
-                    actions, _ = self.predict(extracted_obs, mode="eval")
-                    self.send_chunk_actions(output_channel, actions, mode="eval")
+                    num_envs = 0
+                    for value in extracted_obs.values():
+                        if torch.is_tensor(value):
+                            num_envs = int(value.shape[0])
+                            break
+                        if isinstance(value, list):
+                            num_envs = len(value)
+                            break
+                    spec_countable_mask = None
+                    eval_success_once = env_output.get("eval_success_once")
+                    if eval_success_once is not None:
+                        try:
+                            if torch.is_tensor(eval_success_once):
+                                success_once = (
+                                    eval_success_once.bool().cpu().numpy().reshape(-1)
+                                )
+                            else:
+                                success_once = np.asarray(
+                                    eval_success_once, dtype=np.bool_
+                                ).reshape(-1)
+                            if success_once.size > 0:
+                                spec_countable_mask = np.ones(
+                                    (num_envs,), dtype=np.bool_
+                                )
+                                usable = min(int(success_once.size), int(num_envs))
+                                spec_countable_mask[:usable] = ~success_once[:usable]
+                        except Exception:
+                            spec_countable_mask = None
+                    _ensure_action_plans(stage_id, num_envs)
+                    _clear_plans_on_done(stage_id, env_output)
+
+                    need_plan = [
+                        idx
+                        for idx, plan in enumerate(action_plans[stage_id])
+                        if not plan
+                    ]
+                    actions_new = None
+                    spec_info_list = None
+                    if need_plan:
+                        sliced_obs = _slice_env_obs(extracted_obs, need_plan)
+                        actions_new, result = self.predict(sliced_obs, mode="eval")
+                        if torch.is_tensor(actions_new):
+                            actions_new = actions_new.cpu().numpy()
+                        spec_info_list = (
+                            result.get("spec_info") if isinstance(result, dict) else None
+                        )
+                        if isinstance(spec_info_list, list):
+                            _record_spec_info(
+                                stage_id,
+                                spec_info_list,
+                                need_plan,
+                                num_envs,
+                                countable_mask=spec_countable_mask,
+                            )
+                        for local_idx, env_idx in enumerate(need_plan):
+                            plan_actions = None
+                            if isinstance(spec_info_list, list) and local_idx < len(
+                                spec_info_list
+                            ):
+                                info = spec_info_list[local_idx]
+                                if isinstance(info, dict):
+                                    accepted_actions = info.get("accepted_actions")
+                                    if accepted_actions is not None:
+                                        plan_actions = np.asarray(accepted_actions)
+                            if plan_actions is None and actions_new is not None:
+                                plan_actions = np.asarray(actions_new[local_idx])
+                            if plan_actions is None:
+                                continue
+                            if plan_actions.ndim == 1:
+                                plan_actions = plan_actions[None, ...]
+                            for step_action in plan_actions:
+                                action_plans[stage_id][env_idx].append(
+                                    np.asarray(step_action, dtype=np.float32)
+                                )
+
+                    step_actions = []
+                    for env_idx in range(num_envs):
+                        plan = action_plans[stage_id][env_idx]
+                        if plan:
+                            step_actions.append(
+                                np.asarray(plan.popleft(), dtype=np.float32)
+                            )
+                        else:
+                            step_actions.append(
+                                np.zeros(
+                                    (self.cfg.actor.model.action_dim,),
+                                    dtype=np.float32,
+                                )
+                            )
+                    actions_to_send = np.stack(step_actions, axis=0)[:, None, :]
+                    self.send_chunk_actions(output_channel, actions_to_send, mode="eval")
+            for stage_id in range(self.num_pipeline_stages):
+                env_output = await self.recv_env_output(input_channel, mode="eval")
+                eval_info = env_output.get("eval_info")
+                _log_eval_info(stage_id, eval_info)
+                _clear_plans_on_done(stage_id, env_output)
+        pbar.close()
 
         if self.enable_offload:
             self.offload_model()

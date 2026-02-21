@@ -13,7 +13,42 @@ precision: "bf16"
 value_type: action_level
 
 action_dim: 7
-num_action_chunks: 8
+num_action_chunks: 24
+# eval rollout horizon controls
+# action_horizon: how many actions to take from each model prediction when speculative decoding is disabled.
+action_horizon: null
+# eval_action_horizon: how many actions are actually executed in eval when speculative decoding is disabled.
+eval_action_horizon: null
+
+# speculative decoding controls
+# master switch for speculative decoding in OpenVLA-OFT.
+enable_speculative: false
+# Force KV suffix path to use eager attention backend for stability with cache_position.
+spec_force_eager_attention: true
+# Whether KV suffix pass should return/extend cache again. Keep false for consistency diagnostics.
+spec_kv_use_cache_output: false
+spec_action_horizon: null
+spec_chunk_size: null
+# Limit verification request batch size to avoid OOM in speculative verification.
+# null/<=0 means use all verify requests in a single batch.
+spec_verify_batch_size: 32
+# speculative verification branches
+spec_verify_conf: true
+spec_verify_seq: true
+# When true and conditional tokens are a contiguous prefix, verify by prefix-KV conditioning
+# instead of embedding replacement. Falls back to embedding mode for non-prefix masks.
+spec_cond_prefix_via_kv: false
+spec_debug: false
+# When true, run KV-path vs full-forward consistency check and log the diff.
+# Works for both speculative path and non-spec double-forward debug.
+spec_compare_full_forward: false
+# In compare mode, force both branches to eager attention to avoid backend-only numeric drift.
+spec_compare_force_eager: true
+# In compare mode, also run an alternate KV pass without explicit cache_position to isolate cache_position effects.
+spec_compare_alt_cache_position: true
+# Max mismatch detail logs per env per rollout step when spec_debug=true.
+spec_debug_max_mismatch_logs: 3
+
 use_proprio: False
 use_film: False
 unnorm_key: libero_10_no_noops

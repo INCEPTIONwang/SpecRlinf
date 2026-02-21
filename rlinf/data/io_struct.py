@@ -1167,6 +1167,8 @@ class EnvOutput:
     terminations: Optional[torch.Tensor] = None  # [B]
     truncations: Optional[torch.Tensor] = None  # [B]
     rewards: Optional[torch.Tensor] = None  # [B]
+    eval_info: Optional[list[Optional[dict[str, Any]]]] = None  # eval-only, per-episode info
+    eval_success_once: Optional[torch.Tensor] = None  # eval-only, per-env success_once flag
 
     intervene_actions: Optional[torch.Tensor] = None  # [B]
     intervene_flags: Optional[torch.Tensor] = None  # [B]
@@ -1191,6 +1193,11 @@ class EnvOutput:
         )
         self.rewards = (
             self.rewards.cpu().contiguous() if self.rewards is not None else None
+        )
+        self.eval_success_once = (
+            self.eval_success_once.bool().cpu().contiguous()
+            if self.eval_success_once is not None
+            else None
         )
         self.intervene_actions = (
             self.intervene_actions.cpu().contiguous()
@@ -1235,8 +1242,10 @@ class EnvOutput:
         env_output_dict["terminations"] = self.terminations
         env_output_dict["truncations"] = self.truncations
         env_output_dict["rewards"] = self.rewards
+        env_output_dict["eval_success_once"] = self.eval_success_once
         env_output_dict["intervene_actions"] = self.intervene_actions
         env_output_dict["intervene_flags"] = self.intervene_flags
+        env_output_dict["eval_info"] = self.eval_info
 
         return env_output_dict
 

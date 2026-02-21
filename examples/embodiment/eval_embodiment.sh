@@ -4,8 +4,11 @@ export EMBODIED_PATH="$( cd "$(dirname "${BASH_SOURCE[0]}" )" && pwd )"
 export REPO_PATH=$(dirname $(dirname "$EMBODIED_PATH"))
 export SRC_FILE="${EMBODIED_PATH}/eval_embodied_agent.py"
 
-export MUJOCO_GL="osmesa"
-export PYOPENGL_PLATFORM="osmesa"
+# export MUJOCO_GL="osmesa"
+# export PYOPENGL_PLATFORM="osmesa"
+export MUJOCO_GL="egl"
+export PYOPENGL_PLATFORM="egl"
+
 export PYTHONPATH=${REPO_PATH}:$PYTHONPATH
 
 # Base path to the BEHAVIOR dataset, which is the BEHAVIOR-1k repo's dataset folder
@@ -26,21 +29,47 @@ export PYTHONPATH=${REPO_PATH}:${ROBOTWIN_PATH}:$PYTHONPATH
 export CUDA_LAUNCH_BLOCKING=1
 export HYDRA_FULL_ERROR=1
 
-if [ -z "$1" ]; then
+if [ -z "${1:-}" ]; then
     CONFIG_NAME="maniskill_ppo_openvlaoft"
 else
     CONFIG_NAME=$1
+    shift
 fi
 
 # NOTE: Set the active robot platform (required for correct action dimension and normalization), supported platforms are LIBERO, ALOHA, BRIDGE, default is LIBERO
-ROBOT_PLATFORM=${2:-${ROBOT_PLATFORM:-"LIBERO"}}
+ROBOT_PLATFORM=${ROBOT_PLATFORM:-"LIBERO"}
+
+# If the next argument is not a Hydra override, treat it as robot platform.
+if [ $# -gt 0 ]; then
+    case "$1" in
+        *=*|+*|-*)
+            ;;
+        *)
+            ROBOT_PLATFORM=$1
+            shift
+            ;;
+    esac
+fi
+
+EXTRA_OVERRIDES=("$@")
 
 export ROBOT_PLATFORM
 echo "Using ROBOT_PLATFORM=$ROBOT_PLATFORM"
 
-LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')" #/$(date +'%Y%m%d-%H:%M:%S')"
+LOG_DIR="${REPO_PATH}/logs/$(date +'%Y%m%d-%H:%M:%S')"
 MEGA_LOG_FILE="${LOG_DIR}/eval_embodiment.log"
 mkdir -p "${LOG_DIR}"
-CMD="python ${SRC_FILE} --config-path ${EMBODIED_PATH}/config/ --config-name ${CONFIG_NAME} runner.logger.log_path=${LOG_DIR}"
-echo ${CMD}
-${CMD} 2>&1 | tee ${MEGA_LOG_FILE}
+
+CMD=(
+    python "${SRC_FILE}"
+    --config-path "${EMBODIED_PATH}/config/"
+    --config-name "${CONFIG_NAME}"
+    "runner.logger.log_path=${LOG_DIR}"
+)
+
+if [ ${#EXTRA_OVERRIDES[@]} -gt 0 ]; then
+    CMD+=("${EXTRA_OVERRIDES[@]}")
+fi
+
+echo "${CMD[*]}"
+"${CMD[@]}" 2>&1 | tee "${MEGA_LOG_FILE}"

@@ -12,6 +12,26 @@ is_lora: false
 action_dim: 7
 num_action_chunks: 5
 denoising_steps: 4
+# eval rollout horizon controls (applied when speculative decoding is disabled)
+action_horizon: null
+eval_action_horizon: null
+
+# speculative decoding controls
+enable_speculative: false
+spec_batch_size: 8
+spec_action_horizon: null
+spec_diffusion_num_steps: null
+spec_chunk_size: 5
+rollout_segment: false
+rollout_segment_size: 5
+spec_conf_alpha: 0.8
+spec_conf_eps: 1.0e-6
+spec_delta_threshold: 0.1
+spec_delta_thresholds: null
+spec_verify_conf: true
+spec_verify_seq: true
+spec_debug: false
+spec_profile_timing: false
 policy_setup: "widowx_bridge"
 
 # Observation and embodiment settings
