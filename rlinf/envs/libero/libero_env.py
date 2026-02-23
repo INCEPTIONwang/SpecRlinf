@@ -252,6 +252,10 @@ class LiberoEnv(gym.Env):
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+        episode_info["task_id"] = self.task_ids.copy()
+        episode_info["trial_id"] = self.trial_ids.copy()
+        # Global reset-state index across the whole LIBERO suite.
+        episode_info["reset_state_id"] = self.reset_state_ids.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 

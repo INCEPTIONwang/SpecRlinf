@@ -29,6 +29,11 @@ def prepare_actions_for_maniskill(
     if "panda" in policy:
         return raw_chunk_actions
     # TODO only suitable for action_dim = 7
+    chunk_len = (
+        int(raw_chunk_actions.shape[1])
+        if hasattr(raw_chunk_actions, "shape") and len(raw_chunk_actions.shape) > 1
+        else int(num_action_chunks)
+    )
     reshaped_actions = raw_chunk_actions.reshape(-1, action_dim)
     batch_size = reshaped_actions.shape[0]
     raw_actions = {
@@ -56,7 +61,7 @@ def prepare_actions_for_maniskill(
         [actions["world_vector"], actions["rot_axangle"], actions["gripper"]], dim=1
     ).cuda()
 
-    chunk_actions = actions.reshape(-1, num_action_chunks, action_dim)
+    chunk_actions = actions.reshape(-1, chunk_len, action_dim)
 
     return chunk_actions
 

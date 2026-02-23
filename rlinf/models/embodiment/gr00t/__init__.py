@@ -70,6 +70,23 @@ def get_model(cfg: DictConfig, torch_dtype=torch.bfloat16):
         tune_visual=False,
         tune_llm=False,
         rl_head_config=cfg.rl_head_config,
+        action_horizon=getattr(cfg, "action_horizon", None),
+        eval_action_horizon=getattr(cfg, "eval_action_horizon", None),
+        enable_speculative=getattr(cfg, "enable_speculative", False),
+        spec_batch_size=getattr(cfg, "spec_batch_size", 8),
+        spec_action_horizon=getattr(cfg, "spec_action_horizon", None),
+        spec_diffusion_num_steps=getattr(cfg, "spec_diffusion_num_steps", None),
+        spec_chunk_size=getattr(cfg, "spec_chunk_size", 5),
+        rollout_segment=getattr(cfg, "rollout_segment", False),
+        rollout_segment_size=getattr(cfg, "rollout_segment_size", 5),
+        spec_conf_alpha=getattr(cfg, "spec_conf_alpha", 0.8),
+        spec_conf_eps=getattr(cfg, "spec_conf_eps", 1e-6),
+        spec_delta_threshold=getattr(cfg, "spec_delta_threshold", 0.1),
+        spec_delta_thresholds=getattr(cfg, "spec_delta_thresholds", None),
+        spec_debug=getattr(cfg, "spec_debug", False),
+        spec_profile_timing=getattr(cfg, "spec_profile_timing", False),
+        spec_verify_conf=getattr(cfg, "spec_verify_conf", True),
+        spec_verify_seq=getattr(cfg, "spec_verify_seq", True),
     )
     model.to(torch_dtype)
     if cfg.rl_head_config.add_value_head:
