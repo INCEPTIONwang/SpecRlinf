@@ -212,6 +212,7 @@ class MetaWorldEnv(gym.Env):
 
     def _init_metrics(self):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
+        self.first_success_step = np.full(self.num_envs, -1, dtype=np.int32)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
 
@@ -221,12 +222,14 @@ class MetaWorldEnv(gym.Env):
             mask[env_idx] = True
             self.prev_step_reward[mask] = 0.0
             self.success_once[mask] = False
+            self.first_success_step[mask] = -1
             self.fail_once[mask] = False
             self.returns[mask] = 0
             self._elapsed_steps[env_idx] = 0
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
+            self.first_success_step[:] = -1
             self.fail_once[:] = False
             self.returns[:] = 0.0
             self._elapsed_steps[:] = 0
@@ -235,7 +238,12 @@ class MetaWorldEnv(gym.Env):
         episode_info = {}
         self.returns += step_reward
         self.success_once = self.success_once | terminations
+        new_success = np.logical_and(terminations, self.first_success_step < 0)
+        if new_success.any():
+            self.first_success_step[new_success] = self._elapsed_steps[new_success]
         episode_info["success_once"] = self.success_once.copy()
+        episode_info["first_success_step"] = self.first_success_step.copy()
+        episode_info["success_step"] = self.first_success_step.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]

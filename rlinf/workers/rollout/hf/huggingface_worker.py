@@ -66,10 +66,12 @@ class MultiStepRolloutWorker(Worker):
             rollout_model_config.precision = self.cfg.rollout.model.precision
             rollout_model_config.model_path = self.cfg.rollout.model.model_path
             spec_log_path = None
+            eval_log_path = None
             spec_global_stats_path = None
             log_dir = self.cfg.runner.logger.get("log_path", None)
             if log_dir:
                 spec_log_path = os.path.join(str(log_dir), "spec_debug.log")
+                eval_log_path = os.path.join(str(log_dir), "eval_debug.log")
                 spec_global_stats_path = os.path.join(str(log_dir), "spec_global_stats.json")
                 if rollout_model_config.get("openpi") is None:
                     rollout_model_config.openpi = {}
@@ -77,6 +79,7 @@ class MultiStepRolloutWorker(Worker):
 
         self.hf_model = get_model(rollout_model_config)
         self._spec_log_path = spec_log_path
+        self._eval_log_path = eval_log_path
         self._spec_global_stats_path = spec_global_stats_path
         if spec_log_path:
             setattr(self.hf_model, "spec_log_path", spec_log_path)
@@ -93,6 +96,17 @@ class MultiStepRolloutWorker(Worker):
 
     def _append_spec_log(self, line: str):
         path = getattr(self, "_spec_log_path", None)
+        if not path:
+            return
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(line.rstrip() + "\n")
+        except Exception:
+            return
+
+    def _append_eval_log(self, line: str):
+        path = getattr(self, "_eval_log_path", None)
         if not path:
             return
         try:
@@ -478,6 +492,9 @@ class MultiStepRolloutWorker(Worker):
         spec_total_exec_accept = 0
         spec_total_chunks = 0
         spec_total_reject_dim_counts: list[int] = []
+        success_step_records = [None for _ in range(self.num_pipeline_stages)]
+        success_step_total = 0
+        success_step_count = 0
         action_plans = [None for _ in range(self.num_pipeline_stages)]
         pbar = tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
@@ -544,6 +561,30 @@ class MultiStepRolloutWorker(Worker):
 
         def _fmt_float_list(values: list[float], digits: int = 6) -> list[float]:
             return [round(float(v), digits) for v in values]
+
+        def _to_bool(value: Any) -> bool:
+            if isinstance(value, (bool, np.bool_)):
+                return bool(value)
+            if value is None:
+                return False
+            if isinstance(value, (int, float, np.integer, np.floating)):
+                return float(value) != 0.0
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "t", "yes", "y"}
+            return bool(value)
+
+        def _to_int(value: Any, default: int = -1) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return int(default)
+
+        def _init_success_step_buffers(stage_id: int, num_envs: int):
+            if success_step_records[stage_id] is not None and len(
+                success_step_records[stage_id]
+            ) == int(num_envs):
+                return
+            success_step_records[stage_id] = [[] for _ in range(num_envs)]
 
         def _init_spec_buffers(stage_id: int, num_envs: int):
             if spec_accept_lengths[stage_id] is not None and len(
@@ -687,21 +728,34 @@ class MultiStepRolloutWorker(Worker):
                 action_plans[stage_id][int(env_idx)].clear()
 
         def _log_eval_info(stage_id: int, eval_info: list[dict[str, Any] | None]):
+            nonlocal success_step_total, success_step_count
             if not isinstance(eval_info, list) or not eval_info:
                 return
+            _init_success_step_buffers(stage_id, len(eval_info))
             env_type = getattr(self.cfg.env.eval, "env_type", "env")
             is_metaworld = env_type == "metaworld"
             items = [info for info in eval_info if info]
             for env_idx, info in enumerate(eval_info):
                 if not info:
                     continue
+                success_flag = _to_bool(info.get("success"))
+                episode_len = _to_int(info.get("episode_len", -1), default=-1)
+                success_step = _to_int(info.get("success_step", -1), default=-1)
+                finish_step = success_step if success_flag and success_step >= 0 else -1
+                if finish_step < 0 and success_flag and episode_len >= 0:
+                    finish_step = episode_len
+                if finish_step >= 0:
+                    success_step_records[stage_id][env_idx].append(int(finish_step))
+                    success_step_total += int(finish_step)
+                    success_step_count += 1
                 if is_metaworld:
                     eval_line = (
-                        "metaworld_eval episode={episode} task_id={task_id} task={task} "
-                        "desc={desc} difficulty={difficulty} trial_id={trial_id} "
-                        "success={success} return={return:.4f} episode_len={episode_len}".format(
-                            **info
-                        )
+                        f"metaworld_eval episode={info.get('episode')} "
+                        f"task_id={info.get('task_id', -1)} task={info.get('task')} "
+                        f"desc={info.get('desc')} difficulty={info.get('difficulty')} "
+                        f"trial_id={info.get('trial_id', -1)} success={info.get('success')} "
+                        f"return={float(info.get('return', float('nan'))):.4f} "
+                        f"episode_len={episode_len} success_step={success_step} finish_step={finish_step}"
                     )
                 else:
                     eval_line = (
@@ -711,9 +765,31 @@ class MultiStepRolloutWorker(Worker):
                         f"reset_state_id={info.get('reset_state_id', -1)} "
                         f"success={info.get('success')} "
                         f"return={float(info.get('return', float('nan'))):.4f} "
-                        f"episode_len={info.get('episode_len', -1)}"
+                        f"episode_len={episode_len} success_step={success_step} finish_step={finish_step}"
                     )
                 self._append_spec_log(eval_line)
+                self._append_eval_log(eval_line)
+                success_step_list = success_step_records[stage_id][env_idx]
+                success_step_last = int(success_step_list[-1]) if success_step_list else -1
+                success_step_avg = (
+                    float(sum(success_step_list)) / float(len(success_step_list))
+                    if success_step_list
+                    else -1.0
+                )
+                success_step_global_avg = (
+                    float(success_step_total) / float(success_step_count)
+                    if success_step_count > 0
+                    else -1.0
+                )
+                prefix = "metaworld" if is_metaworld else env_type
+                success_line = (
+                    f"{prefix}_success_steps episode={int(info.get('episode', -1))} "
+                    f"success_step_last={success_step_last} "
+                    f"success_step_avg={success_step_avg:.3f} "
+                    f"success_step_global_avg={success_step_global_avg:.3f} "
+                    f"success_count={len(success_step_list)}"
+                )
+                self._append_eval_log(success_line)
                 if spec_accept_lengths[stage_id] is None:
                     continue
                 accept_list = spec_accept_lengths[stage_id][env_idx]
@@ -789,8 +865,6 @@ class MultiStepRolloutWorker(Worker):
                         verify_conf = True
                     if verify_seq is None:
                         verify_seq = True
-
-                    prefix = "metaworld" if is_metaworld else env_type
                     spec_line = (
                         f"{prefix}_spec episode={int(info['episode'])} "
                         f"verify_conf={int(bool(verify_conf))} verify_seq={int(bool(verify_seq))} "
@@ -806,10 +880,15 @@ class MultiStepRolloutWorker(Worker):
                         f"conf_mu_abs_mean_dim={_fmt_float_list(conf_mu_abs_mean_dim)} "
                         f"conf_var_mean_dim={_fmt_float_list(conf_var_mean_dim)} "
                         f"conf_var_max_dim={_fmt_float_list(conf_var_max_dim)} "
+                        f"success_step_last={success_step_last} "
+                        f"success_step_avg={success_step_avg:.3f} "
+                        f"success_step_global_avg={success_step_global_avg:.3f} "
+                        f"success_count={len(success_step_list)} "
                         f"reject_dims={reject_dims} global_reject_dims={global_reject_dims} "
                         f"last_reject={reject_msg}"
                     )
                     self._append_spec_log(spec_line)
+                    self._append_eval_log(spec_line)
                     spec_accept_lengths[stage_id][env_idx] = []
                     spec_accept_exec_lengths[stage_id][env_idx] = []
                     spec_reject_counts[stage_id][env_idx] = {"conf": 0, "seq": 0}

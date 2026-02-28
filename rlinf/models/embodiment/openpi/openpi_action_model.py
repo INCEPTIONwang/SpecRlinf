@@ -582,6 +582,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         observation = _model.Observation.from_dict(processed_obs)
 
         action_horizon = self._spec_action_horizon()
+        eval_horizon = self._eval_action_horizon()
         diffusion_num_steps = self._spec_diffusion_steps()
         batch_size = self._spec_batch_size()
         spec_chunk_size = int(self.config.spec_chunk_size)
@@ -620,7 +621,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             rollout_segment_size=rollout_segment_size,
             chunked_draft=chunked_draft,
             timing_enabled=timing_enabled,
-            output_len=action_horizon,
+            output_len=eval_horizon,
             verify_conf_enabled=verify_conf_enabled,
             verify_seq_enabled=verify_seq_enabled,
         )
@@ -934,6 +935,23 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 f.write(line.rstrip() + "\n")
         except Exception:
             return
+
+    def _snapshot_rng_state(self) -> dict[str, Any]:
+        state: dict[str, Any] = {
+            "python": random.getstate(),
+            "numpy": np.random.get_state(),
+            "torch_cpu": torch.random.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["torch_cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    def _restore_rng_state(self, state: dict[str, Any]):
+        random.setstate(state["python"])
+        np.random.set_state(state["numpy"])
+        torch.random.set_rng_state(state["torch_cpu"])
+        if "torch_cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(state["torch_cuda"])
 
     def _compute_prefix_cache(
         self,
@@ -1462,133 +1480,138 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         conf_stop_prefix_len: int | None = None
         seq_stop_prefix_len: int | None = None
 
-        for order_conf_full, order_seq_full, chunk_start, chunk_end in chunk_orders:
-            verify_h = int(chunk_end)
-            order_conf = (
-                _pending_order(order_conf_full, accepted_positions_conf)
-                if conf_active
-                else np.zeros((0,), dtype=np.int64)
-            )
-            order_seq = (
-                _pending_order(order_seq_full, accepted_positions_seq)
-                if seq_active
-                else np.zeros((0,), dtype=np.int64)
-            )
-            k_conf = int(order_conf.shape[0])
-            k_seq = int(order_seq.shape[0])
-            k_total = k_conf + k_seq
-            if k_total == 0:
-                continue
-
-            fixed_actions_batch = np.zeros((k_total, verify_h, d_model), dtype=greedy_chain_raw_full.dtype)
-            fixed_action_mask_batch = np.zeros((k_total, verify_h), dtype=np.bool_)
-
-            if conf_active:
-                pos_fixed_global = np.asarray(
-                    sorted(p for p in accepted_positions_conf if p < int(verify_h)), dtype=np.int64
+        verify_rng_state = self._snapshot_rng_state()
+        try:
+            for order_conf_full, order_seq_full, chunk_start, chunk_end in chunk_orders:
+                verify_h = int(chunk_end)
+                order_conf = (
+                    _pending_order(order_conf_full, accepted_positions_conf)
+                    if conf_active
+                    else np.zeros((0,), dtype=np.int64)
                 )
-                for i in range(k_conf):
-                    if pos_fixed_global.size:
-                        fixed_actions_batch[i, pos_fixed_global] = greedy_chain_raw_full[pos_fixed_global]
-                        fixed_action_mask_batch[i, pos_fixed_global] = True
-                    if i > 0:
-                        pos_prev = order_conf[:i]
-                        fixed_actions_batch[i, pos_prev] = greedy_chain_raw_full[pos_prev]
-                        fixed_action_mask_batch[i, pos_prev] = True
-
-            if seq_active:
-                pos_fixed_global = np.asarray(
-                    sorted(p for p in accepted_positions_seq if p < int(verify_h)), dtype=np.int64
+                order_seq = (
+                    _pending_order(order_seq_full, accepted_positions_seq)
+                    if seq_active
+                    else np.zeros((0,), dtype=np.int64)
                 )
-                for i in range(k_seq):
-                    j = k_conf + i
-                    if pos_fixed_global.size:
-                        fixed_actions_batch[j, pos_fixed_global] = greedy_chain_raw_full[pos_fixed_global]
-                        fixed_action_mask_batch[j, pos_fixed_global] = True
-                    if i > 0:
-                        pos_prev = order_seq[:i]
-                        fixed_actions_batch[j, pos_prev] = greedy_chain_raw_full[pos_prev]
-                        fixed_action_mask_batch[j, pos_prev] = True
+                k_conf = int(order_conf.shape[0])
+                k_seq = int(order_seq.shape[0])
+                k_total = k_conf + k_seq
+                if k_total == 0:
+                    continue
 
-            obs_verify = self._repeat_observation(observation, k_total)
-            fixed_actions_t = torch.as_tensor(fixed_actions_batch, device=observation.state.device)
-            fixed_action_mask_t = torch.as_tensor(fixed_action_mask_batch, device=observation.state.device)
-            verify_actions_raw = self._spec_sample_actions(
-                obs_verify,
-                num_steps=int(diffusion_num_steps),
-                action_horizon=int(verify_h),
-                fixed_actions=fixed_actions_t,
-                fixed_action_mask=fixed_action_mask_t,
-                prefix_cache=prefix_cache,
-                profile_timing=bool(timing_enabled),
-            )
-            verify_actions = self._apply_output_transform(
-                verify_actions_raw, obs_verify.state, limit_chunk=False
-            )
-            verify_actions_raw_np = verify_actions_raw.detach().float().cpu().numpy()
+                fixed_actions_batch = np.zeros((k_total, verify_h, d_model), dtype=greedy_chain_raw_full.dtype)
+                fixed_action_mask_batch = np.zeros((k_total, verify_h), dtype=np.bool_)
 
-            if conf_active:
-                (
-                    accepted_positions_conf,
-                    accepted_rank_conf,
-                    conf_active,
-                    conf_fail_pos,
-                    conf_fail_action,
-                    conf_fail_detail,
-                ) = _run_verification_chunk(
-                    kind="conf",
-                    verify_order=order_conf,
-                    verify_actions_compare_slice=verify_actions_raw_np[:k_conf],
-                    verify_actions_exec_slice=verify_actions[:k_conf],
-                    accepted_positions=accepted_positions_conf,
-                    accepted_rank=accepted_rank_conf,
-                    chunk_start=chunk_start,
+                if conf_active:
+                    pos_fixed_global = np.asarray(
+                        sorted(p for p in accepted_positions_conf if p < int(verify_h)), dtype=np.int64
+                    )
+                    for i in range(k_conf):
+                        if pos_fixed_global.size:
+                            fixed_actions_batch[i, pos_fixed_global] = greedy_chain_raw_full[pos_fixed_global]
+                            fixed_action_mask_batch[i, pos_fixed_global] = True
+                        if i > 0:
+                            pos_prev = order_conf[:i]
+                            fixed_actions_batch[i, pos_prev] = greedy_chain_raw_full[pos_prev]
+                            fixed_action_mask_batch[i, pos_prev] = True
+
+                if seq_active:
+                    pos_fixed_global = np.asarray(
+                        sorted(p for p in accepted_positions_seq if p < int(verify_h)), dtype=np.int64
+                    )
+                    for i in range(k_seq):
+                        j = k_conf + i
+                        if pos_fixed_global.size:
+                            fixed_actions_batch[j, pos_fixed_global] = greedy_chain_raw_full[pos_fixed_global]
+                            fixed_action_mask_batch[j, pos_fixed_global] = True
+                        if i > 0:
+                            pos_prev = order_seq[:i]
+                            fixed_actions_batch[j, pos_prev] = greedy_chain_raw_full[pos_prev]
+                            fixed_action_mask_batch[j, pos_prev] = True
+
+                obs_verify = self._repeat_observation(observation, k_total)
+                fixed_actions_t = torch.as_tensor(fixed_actions_batch, device=observation.state.device)
+                fixed_action_mask_t = torch.as_tensor(fixed_action_mask_batch, device=observation.state.device)
+                verify_actions_raw = self._spec_sample_actions(
+                    obs_verify,
+                    num_steps=int(diffusion_num_steps),
+                    action_horizon=int(verify_h),
+                    fixed_actions=fixed_actions_t,
+                    fixed_action_mask=fixed_action_mask_t,
+                    prefix_cache=prefix_cache,
+                    profile_timing=bool(timing_enabled),
                 )
-                if not conf_active and fail_pos_conf is None:
-                    fail_pos_conf = conf_fail_pos
-                    fail_action_conf = conf_fail_action
-                    fail_detail_conf = conf_fail_detail
-                if not conf_active:
-                    conf_stop_prefix_len = _prefix_len(accepted_positions_conf)
-
-            if seq_active:
-                (
-                    accepted_positions_seq,
-                    accepted_rank_seq,
-                    seq_active,
-                    seq_fail_pos,
-                    seq_fail_action,
-                    seq_fail_detail,
-                ) = _run_verification_chunk(
-                    kind="seq",
-                    verify_order=order_seq,
-                    verify_actions_compare_slice=verify_actions_raw_np[k_conf:],
-                    verify_actions_exec_slice=verify_actions[k_conf:],
-                    accepted_positions=accepted_positions_seq,
-                    accepted_rank=accepted_rank_seq,
-                    chunk_start=chunk_start,
+                verify_actions = self._apply_output_transform(
+                    verify_actions_raw, obs_verify.state, limit_chunk=False
                 )
-                if not seq_active and fail_pos_seq is None:
-                    fail_pos_seq = seq_fail_pos
-                    fail_action_seq = seq_fail_action
-                    fail_detail_seq = seq_fail_detail
-                if not seq_active:
-                    seq_stop_prefix_len = _prefix_len(accepted_positions_seq)
+                verify_actions_raw_np = verify_actions_raw.detach().float().cpu().numpy()
 
-            if (
-                seq_active
-                and conf_stop_prefix_len is not None
-                and _prefix_len(accepted_positions_seq) >= int(conf_stop_prefix_len)
-            ):
-                seq_active = False
-            if (
-                conf_active
-                and seq_stop_prefix_len is not None
-                and _prefix_len(accepted_positions_conf) >= int(seq_stop_prefix_len)
-            ):
-                conf_active = False
-            if not conf_active and not seq_active:
-                break
+                if conf_active:
+                    (
+                        accepted_positions_conf,
+                        accepted_rank_conf,
+                        conf_active,
+                        conf_fail_pos,
+                        conf_fail_action,
+                        conf_fail_detail,
+                    ) = _run_verification_chunk(
+                        kind="conf",
+                        verify_order=order_conf,
+                        verify_actions_compare_slice=verify_actions_raw_np[:k_conf],
+                        verify_actions_exec_slice=verify_actions[:k_conf],
+                        accepted_positions=accepted_positions_conf,
+                        accepted_rank=accepted_rank_conf,
+                        chunk_start=chunk_start,
+                    )
+                    if not conf_active and fail_pos_conf is None:
+                        fail_pos_conf = conf_fail_pos
+                        fail_action_conf = conf_fail_action
+                        fail_detail_conf = conf_fail_detail
+                    if not conf_active:
+                        conf_stop_prefix_len = _prefix_len(accepted_positions_conf)
+
+                if seq_active:
+                    (
+                        accepted_positions_seq,
+                        accepted_rank_seq,
+                        seq_active,
+                        seq_fail_pos,
+                        seq_fail_action,
+                        seq_fail_detail,
+                    ) = _run_verification_chunk(
+                        kind="seq",
+                        verify_order=order_seq,
+                        verify_actions_compare_slice=verify_actions_raw_np[k_conf:],
+                        verify_actions_exec_slice=verify_actions[k_conf:],
+                        accepted_positions=accepted_positions_seq,
+                        accepted_rank=accepted_rank_seq,
+                        chunk_start=chunk_start,
+                    )
+                    if not seq_active and fail_pos_seq is None:
+                        fail_pos_seq = seq_fail_pos
+                        fail_action_seq = seq_fail_action
+                        fail_detail_seq = seq_fail_detail
+                    if not seq_active:
+                        seq_stop_prefix_len = _prefix_len(accepted_positions_seq)
+
+                if (
+                    seq_active
+                    and conf_stop_prefix_len is not None
+                    and _prefix_len(accepted_positions_seq) >= int(conf_stop_prefix_len)
+                ):
+                    seq_active = False
+                if (
+                    conf_active
+                    and seq_stop_prefix_len is not None
+                    and _prefix_len(accepted_positions_conf) >= int(seq_stop_prefix_len)
+                ):
+                    conf_active = False
+                if not conf_active and not seq_active:
+                    break
+        finally:
+            # Keep speculative verification from perturbing the global RNG stream.
+            self._restore_rng_state(verify_rng_state)
 
         accepted_prefix_len_conf = _prefix_len(accepted_positions_conf)
         accepted_prefix_len_seq = _prefix_len(accepted_positions_seq)
@@ -1629,6 +1652,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 chunk = np.concatenate([chunk, pad], axis=0)
             if chunk.shape[0] > int(output_len):
                 chunk = chunk[: int(output_len)]
+        exec_actions = np.asarray(chunk)
 
         info: dict[str, Any] = {
             "accepted_prefix_len": int(accepted_prefix_len),
@@ -1641,6 +1665,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             "selected_path": selected_path,
             "spec_chunk_size": int(chunk_size),
             "verify_chunks": chunk_summaries,
+            # accepted_actions is the true verified plan used by rollout execution.
+            # `chunk` (function return) is padded/truncated only to keep batch stacking.
             "accepted_actions": accepted_actions,
             "accepted_exec_len": int(accepted_exec_len),
             "conf_stats": conf_stats if log_conf_stats and isinstance(conf_stats, dict) else None,

@@ -305,6 +305,12 @@ class EnvWorker(Worker):
         success_arr = _select(success)
         returns = _select(env_info.get("return", np.array([float("nan")])))
         episode_len = _select(env_info.get("episode_len", np.array([-1])))
+        success_step = _select(
+            env_info.get(
+                "success_step",
+                env_info.get("first_success_step", np.array([-1])),
+            )
+        )
 
         eval_info: list[dict[str, Any] | None] = [None for _ in range(num_envs)]
         done_indices = np.flatnonzero(done_mask_np)
@@ -334,6 +340,7 @@ class EnvWorker(Worker):
                 "success": success_flag,
                 "return": return_val,
                 "episode_len": episode_len_val,
+                "success_step": int(success_step[i]) if np.size(success_step) > i else -1,
             }
         return eval_info
 
@@ -378,6 +385,12 @@ class EnvWorker(Worker):
         success_arr = _select(success)
         returns = _select(env_info.get("return", np.array([float("nan")])))
         episode_len = _select(env_info.get("episode_len", np.array([-1])))
+        success_step = _select(
+            env_info.get(
+                "success_step",
+                env_info.get("first_success_step", np.array([-1])),
+            )
+        )
 
         eval_info: list[dict[str, Any] | None] = [None for _ in range(num_envs)]
         done_indices = np.flatnonzero(done_mask_np)
@@ -399,6 +412,7 @@ class EnvWorker(Worker):
                 "success": success_flag,
                 "return": float(returns[i]) if np.size(returns) > i else float("nan"),
                 "episode_len": int(episode_len[i]) if np.size(episode_len) > i else -1,
+                "success_step": int(success_step[i]) if np.size(success_step) > i else -1,
             }
         return eval_info
 

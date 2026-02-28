@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import os
+import warnings
 from typing import Optional, OrderedDict, Union
 
 import gymnasium as gym
@@ -206,6 +207,9 @@ class ManiskillEnv(gym.Env):
         self.success_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
+        self.success_step = torch.full(
+            (self.num_envs,), -1, device=self.device, dtype=torch.int32
+        )
         self.fail_once = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.bool
         )
@@ -220,12 +224,14 @@ class ManiskillEnv(gym.Env):
             self.prev_step_reward[mask] = 0.0
             if self.record_metrics:
                 self.success_once[mask] = False
+                self.success_step[mask] = -1
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
+                self.success_step[:] = -1
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
 
@@ -233,8 +239,16 @@ class ManiskillEnv(gym.Env):
         episode_info = {}
         self.returns += step_reward
         if "success" in infos:
-            self.success_once = self.success_once | infos["success"]
+            success_now = infos["success"].bool()
+            first_success_mask = torch.logical_and(success_now, torch.logical_not(self.success_once))
+            if first_success_mask.any():
+                # Record first timestep where success becomes True for each env.
+                self.success_step[first_success_mask] = self.elapsed_steps[first_success_mask].to(
+                    dtype=torch.int32
+                )
+            self.success_once = self.success_once | success_now
             episode_info["success_once"] = self.success_once.clone()
+            episode_info["success_step"] = self.success_step.clone()
         if "fail" in infos:
             self.fail_once = self.fail_once | infos["fail"]
             episode_info["fail_once"] = self.fail_once.clone()
@@ -371,6 +385,10 @@ class ManiskillEnv(gym.Env):
         img = common.to_numpy(img)
         if len(img.shape) == 3:
             img = img[None]
+        if len(img.shape) > 3:
+            max_render_envs = int(getattr(self.video_cfg, "max_render_envs", 64))
+            if max_render_envs > 0 and len(img) > max_render_envs:
+                img = img[:max_render_envs]
 
         if infos is not None:
             for i in range(len(img)):
@@ -382,7 +400,7 @@ class ManiskillEnv(gym.Env):
             if len(img) == 1:
                 img = img[0]
             else:
-                img = tile_images(img, nrows=int(np.sqrt(self.num_envs)))
+                img = tile_images(img, nrows=int(np.sqrt(len(img))))
         return img
 
     def render(self, info, rew=None):
@@ -413,19 +431,82 @@ class ManiskillEnv(gym.Env):
     def add_new_frames_from_obs(self, raw_obs):
         """For debugging render"""
         raw_imgs = common.to_numpy(raw_obs["main_images"])
-        raw_full_img = tile_images(raw_imgs, nrows=int(np.sqrt(self.num_envs)))
+        max_render_envs = int(getattr(self.video_cfg, "max_render_envs", 64))
+        if max_render_envs > 0 and len(raw_imgs) > max_render_envs:
+            raw_imgs = raw_imgs[:max_render_envs]
+        raw_full_img = tile_images(raw_imgs, nrows=int(np.sqrt(len(raw_imgs))))
         self.render_images.append(raw_full_img)
 
     def flush_video(self, video_sub_dir: Optional[str] = None):
+        if not self.render_images:
+            return
         output_dir = os.path.join(self.video_cfg.video_base_dir, f"seed_{self.seed}")
         if video_sub_dir is not None:
             output_dir = os.path.join(output_dir, f"{video_sub_dir}")
-        images_to_video(
-            self.render_images,
-            output_dir=output_dir,
-            video_name=f"{self.video_cnt}",
-            fps=self.cfg.init_params.sim_config.control_freq,
-            verbose=False,
-        )
-        self.video_cnt += 1
-        self.render_images = []
+        frames = self._prepare_video_frames(self.render_images)
+        try:
+            images_to_video(
+                frames,
+                output_dir=output_dir,
+                video_name=f"{self.video_cnt}",
+                fps=self.cfg.init_params.sim_config.control_freq,
+                verbose=False,
+            )
+        except Exception as exc:
+            warnings.warn(
+                f"Failed to save video seed_{self.seed}/{self.video_cnt}.mp4: {exc}"
+            )
+        finally:
+            self.video_cnt += 1
+            self.render_images = []
+
+    def _prepare_video_frames(self, frames: list[np.ndarray]) -> list[np.ndarray]:
+        """Make frames encoder-safe by normalizing channels/dtype and clipping size."""
+        max_side = int(getattr(self.video_cfg, "max_video_side", 16384))
+        processed_frames = []
+        resized = False
+        for frame in frames:
+            img = common.to_numpy(frame)
+            if img.ndim == 2:
+                img = np.repeat(img[..., None], 3, axis=-1)
+            elif img.ndim == 3 and img.shape[-1] == 1:
+                img = np.repeat(img, 3, axis=-1)
+            elif img.ndim == 3 and img.shape[-1] > 3:
+                img = img[..., :3]
+            if img.dtype != np.uint8:
+                img = img.astype(np.uint8)
+
+            h, w = img.shape[:2]
+            if h <= 0 or w <= 0:
+                continue
+
+            # libx264 has max resolution constraints; keep within bounds.
+            scale = min(1.0, max_side / float(max(h, w)))
+            new_h = max(2, int(h * scale))
+            new_w = max(2, int(w * scale))
+            # yuv420p expects even dimensions.
+            new_h -= new_h % 2
+            new_w -= new_w % 2
+            if new_h < 2:
+                new_h = 2
+            if new_w < 2:
+                new_w = 2
+            if new_h != h or new_w != w:
+                img = self._resize_nearest(img, new_h, new_w)
+                resized = True
+            processed_frames.append(img)
+
+        if resized:
+            warnings.warn(
+                f"Video frames were downscaled to max side {max_side} for encoding."
+            )
+        return processed_frames if processed_frames else [common.to_numpy(frames[0])]
+
+    def _resize_nearest(self, img: np.ndarray, new_h: int, new_w: int) -> np.ndarray:
+        """Resize an image with nearest-neighbor sampling using numpy indexing."""
+        src_h, src_w = img.shape[:2]
+        if src_h == new_h and src_w == new_w:
+            return img
+        row_idx = np.linspace(0, src_h - 1, new_h).astype(np.int32)
+        col_idx = np.linspace(0, src_w - 1, new_w).astype(np.int32)
+        return img[row_idx][:, col_idx]

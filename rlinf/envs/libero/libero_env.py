@@ -227,6 +227,7 @@ class LiberoEnv(gym.Env):
         self.success_once = np.zeros(self.num_envs, dtype=bool)
         self.fail_once = np.zeros(self.num_envs, dtype=bool)
         self.returns = np.zeros(self.num_envs)
+        self.first_success_step = np.full(self.num_envs, -1, dtype=np.int32)
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -237,17 +238,22 @@ class LiberoEnv(gym.Env):
             self.fail_once[mask] = False
             self.returns[mask] = 0
             self._elapsed_steps[env_idx] = 0
+            self.first_success_step[env_idx] = -1
         else:
             self.prev_step_reward[:] = 0
             self.success_once[:] = False
             self.fail_once[:] = False
             self.returns[:] = 0.0
             self._elapsed_steps[:] = 0
+            self.first_success_step[:] = -1
 
     def _record_metrics(self, step_reward, terminations, infos):
         episode_info = {}
         self.returns += step_reward
         self.success_once = self.success_once | terminations
+        new_success = np.logical_and(terminations, self.first_success_step < 0)
+        if new_success.any():
+            self.first_success_step[new_success] = self._elapsed_steps[new_success]
         episode_info["success_once"] = self.success_once.copy()
         episode_info["return"] = self.returns.copy()
         episode_info["episode_len"] = self.elapsed_steps.copy()
@@ -256,6 +262,8 @@ class LiberoEnv(gym.Env):
         episode_info["trial_id"] = self.trial_ids.copy()
         # Global reset-state index across the whole LIBERO suite.
         episode_info["reset_state_id"] = self.reset_state_ids.copy()
+        episode_info["first_success_step"] = self.first_success_step.copy()
+        episode_info["success_step"] = self.first_success_step.copy()
         infos["episode"] = to_tensor(episode_info)
         return infos
 
