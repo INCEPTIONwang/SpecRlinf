@@ -578,6 +578,23 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         )
         return additive_mask
 
+    def _llama_uses_sdpa_attention(self) -> bool:
+        llm_model = getattr(self.language_model, "model", None)
+        layers = getattr(llm_model, "layers", None)
+        if layers is not None and len(layers) > 0:
+            first_attn = getattr(layers[0], "self_attn", None)
+            if first_attn is not None:
+                return type(first_attn).__name__ == "LlamaSdpaAttention"
+
+        lm_config = getattr(self.language_model, "config", None)
+        if lm_config is None:
+            return False
+
+        attn_impl = getattr(lm_config, "_attn_implementation", None)
+        if attn_impl is None:
+            attn_impl = getattr(lm_config, "attn_implementation", None)
+        return str(attn_impl).lower() == "sdpa"
+
     def _forward_action_logits_with_prefix_cache(
         self,
         *,
@@ -836,6 +853,11 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
             cond_full_attention_mask = torch.cat(
                 [prefix_attention_mask, cond_prefix_attention_mask], dim=1
             )
+            cond_full_attention_mask_4d = self._build_suffix_attention_mask_4d(
+                prefix_attention_mask=prefix_attention_mask,
+                suffix_attention_mask=cond_prefix_attention_mask,
+                dtype=cond_prefix_embeddings.dtype,
+            )
             cond_position_offsets = torch.arange(
                 cond_prefix_len,
                 device=prefix_last_position_ids.device,
@@ -850,9 +872,14 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
                 device=prefix_attention_mask.device,
                 dtype=torch.long,
             )
+            cond_attention_mask_for_forward = (
+                cond_full_attention_mask_4d
+                if self._llama_uses_sdpa_attention() and not force_eager_attention
+                else cond_full_attention_mask
+            )
             cond_outputs = self.language_model(
                 input_ids=None,
-                attention_mask=cond_full_attention_mask,
+                attention_mask=cond_attention_mask_for_forward,
                 position_ids=cond_position_ids,
                 cache_position=cond_cache_position if use_cache_position else None,
                 past_key_values=past_key_values,
@@ -958,9 +985,14 @@ class OpenVLAOFTForRLActionPrediction(OpenVLAOFTForActionPrediction, BasePolicy)
         except Exception:
             pass
         if suffix_decode_len > 0:
+            suffix_attention_mask_for_forward = (
+                full_attention_mask_4d
+                if self._llama_uses_sdpa_attention() and not force_eager_attention
+                else full_attention_mask
+            )
             suffix_outputs = self.language_model(
                 input_ids=None,
-                attention_mask=full_attention_mask,
+                attention_mask=suffix_attention_mask_for_forward,
                 position_ids=suffix_position_ids,
                 cache_position=cache_position if use_cache_position else None,
                 past_key_values=past_key_values,

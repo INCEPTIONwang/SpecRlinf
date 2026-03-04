@@ -941,7 +941,9 @@ def validate_cfg(cfg: DictConfig) -> DictConfig:
         return cfg
 
     if cfg.algorithm.adv_type in ("grpo", "reinpp_baseline"):
-        assert cfg.algorithm.group_size > 1
+        only_eval = bool(cfg.runner.get("only_eval", False))
+        if not only_eval:
+            assert cfg.algorithm.group_size > 1
 
     assert cfg.actor.training_backend in SUPPORTED_TRAINING_BACKENDS, (
         f"Unsupported training_backend {cfg.actor.training_backend}. Supported training backends are {SUPPORTED_TRAINING_BACKENDS}."

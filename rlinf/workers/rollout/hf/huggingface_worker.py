@@ -488,13 +488,21 @@ class MultiStepRolloutWorker(Worker):
         spec_conf_var_max_dims = [None for _ in range(self.num_pipeline_stages)]
         spec_verify_conf_flags = [None for _ in range(self.num_pipeline_stages)]
         spec_verify_seq_flags = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_prefill_ms = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_diffusion_ms_full = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_verify_prefill_ms = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_verify_diffusion_ms = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_verify_check_ms = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_verify_total_ms = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_verify_calls = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_prefill_ms_per_env = [None for _ in range(self.num_pipeline_stages)]
+        spec_timing_end2end_ms_per_step = [None for _ in range(self.num_pipeline_stages)]
+        success_step_global_sum = 0
+        success_step_global_count = 0
         spec_total_accept = 0
         spec_total_exec_accept = 0
         spec_total_chunks = 0
         spec_total_reject_dim_counts: list[int] = []
-        success_step_records = [None for _ in range(self.num_pipeline_stages)]
-        success_step_total = 0
-        success_step_count = 0
         action_plans = [None for _ in range(self.num_pipeline_stages)]
         pbar = tqdm(
             range(self.cfg.algorithm.eval_rollout_epoch),
@@ -562,29 +570,23 @@ class MultiStepRolloutWorker(Worker):
         def _fmt_float_list(values: list[float], digits: int = 6) -> list[float]:
             return [round(float(v), digits) for v in values]
 
-        def _to_bool(value: Any) -> bool:
-            if isinstance(value, (bool, np.bool_)):
-                return bool(value)
+        def _mean_or_nan(values: list[float]) -> float:
+            if not values:
+                return float("nan")
+            return float(sum(values)) / float(len(values))
+
+        def _append_metric(storage, stage_id: int, env_idx: int, value: Any):
             if value is None:
-                return False
-            if isinstance(value, (int, float, np.integer, np.floating)):
-                return float(value) != 0.0
-            if isinstance(value, str):
-                return value.strip().lower() in {"1", "true", "t", "yes", "y"}
-            return bool(value)
-
-        def _to_int(value: Any, default: int = -1) -> int:
-            try:
-                return int(value)
-            except Exception:
-                return int(default)
-
-        def _init_success_step_buffers(stage_id: int, num_envs: int):
-            if success_step_records[stage_id] is not None and len(
-                success_step_records[stage_id]
-            ) == int(num_envs):
                 return
-            success_step_records[stage_id] = [[] for _ in range(num_envs)]
+            stage_buf = storage[stage_id]
+            if stage_buf is None:
+                return
+            if env_idx < 0 or env_idx >= len(stage_buf):
+                return
+            try:
+                stage_buf[env_idx].append(float(value))
+            except Exception:
+                return
 
         def _init_spec_buffers(stage_id: int, num_envs: int):
             if spec_accept_lengths[stage_id] is not None and len(
@@ -606,6 +608,15 @@ class MultiStepRolloutWorker(Worker):
             spec_conf_var_max_dims[stage_id] = [[] for _ in range(num_envs)]
             spec_verify_conf_flags[stage_id] = [None for _ in range(num_envs)]
             spec_verify_seq_flags[stage_id] = [None for _ in range(num_envs)]
+            spec_timing_prefill_ms[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_diffusion_ms_full[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_verify_prefill_ms[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_verify_diffusion_ms[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_verify_check_ms[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_verify_total_ms[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_verify_calls[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_prefill_ms_per_env[stage_id] = [[] for _ in range(num_envs)]
+            spec_timing_end2end_ms_per_step[stage_id] = [[] for _ in range(num_envs)]
 
         def _record_spec_info(
             stage_id: int,
@@ -669,6 +680,60 @@ class MultiStepRolloutWorker(Worker):
                     spec_verify_conf_flags[stage_id][env_idx] = bool(verify_conf)
                 if verify_seq is not None:
                     spec_verify_seq_flags[stage_id][env_idx] = bool(verify_seq)
+                _append_metric(
+                    spec_timing_prefill_ms,
+                    stage_id,
+                    env_idx,
+                    info.get("prefill_ms"),
+                )
+                _append_metric(
+                    spec_timing_diffusion_ms_full,
+                    stage_id,
+                    env_idx,
+                    info.get("diffusion_ms_full"),
+                )
+                _append_metric(
+                    spec_timing_verify_prefill_ms,
+                    stage_id,
+                    env_idx,
+                    info.get("verify_prefill_ms"),
+                )
+                _append_metric(
+                    spec_timing_verify_diffusion_ms,
+                    stage_id,
+                    env_idx,
+                    info.get("verify_diffusion_ms"),
+                )
+                _append_metric(
+                    spec_timing_verify_check_ms,
+                    stage_id,
+                    env_idx,
+                    info.get("verify_check_ms"),
+                )
+                _append_metric(
+                    spec_timing_verify_total_ms,
+                    stage_id,
+                    env_idx,
+                    info.get("verify_total_ms"),
+                )
+                _append_metric(
+                    spec_timing_verify_calls,
+                    stage_id,
+                    env_idx,
+                    info.get("verify_calls"),
+                )
+                _append_metric(
+                    spec_timing_prefill_ms_per_env,
+                    stage_id,
+                    env_idx,
+                    info.get("prefill_ms_per_env"),
+                )
+                _append_metric(
+                    spec_timing_end2end_ms_per_step,
+                    stage_id,
+                    env_idx,
+                    info.get("end2end_ms_per_step"),
+                )
 
                 reject = info.get("reject")
                 over_dims = None
@@ -728,72 +793,133 @@ class MultiStepRolloutWorker(Worker):
                 action_plans[stage_id][int(env_idx)].clear()
 
         def _log_eval_info(stage_id: int, eval_info: list[dict[str, Any] | None]):
-            nonlocal success_step_total, success_step_count
+            nonlocal success_step_global_sum, success_step_global_count
             if not isinstance(eval_info, list) or not eval_info:
                 return
-            _init_success_step_buffers(stage_id, len(eval_info))
             env_type = getattr(self.cfg.env.eval, "env_type", "env")
             is_metaworld = env_type == "metaworld"
+            prefix = "metaworld" if is_metaworld else env_type
             items = [info for info in eval_info if info]
             for env_idx, info in enumerate(eval_info):
                 if not info:
                     continue
-                success_flag = _to_bool(info.get("success"))
-                episode_len = _to_int(info.get("episode_len", -1), default=-1)
-                success_step = _to_int(info.get("success_step", -1), default=-1)
-                finish_step = success_step if success_flag and success_step >= 0 else -1
-                if finish_step < 0 and success_flag and episode_len >= 0:
-                    finish_step = episode_len
+                episode = int(info.get("episode", -1))
+                try:
+                    success_step = int(info.get("success_step", -1))
+                except Exception:
+                    success_step = -1
+                try:
+                    episode_len = int(info.get("episode_len", -1))
+                except Exception:
+                    episode_len = -1
+                success_flag = bool(info.get("success"))
+                finish_step = -1
+                if success_flag:
+                    if success_step >= 0:
+                        finish_step = success_step
+                    elif episode_len >= 0:
+                        finish_step = episode_len
+                success_step_last = -1
+                success_step_avg = float("nan")
+                success_count = 0
                 if finish_step >= 0:
-                    success_step_records[stage_id][env_idx].append(int(finish_step))
-                    success_step_total += int(finish_step)
-                    success_step_count += 1
+                    success_step_global_sum += int(finish_step)
+                    success_step_global_count += 1
+                    success_step_last = int(finish_step)
+                    success_count = int(success_step_global_count)
+                    success_step_avg = float(success_step_global_sum) / float(
+                        success_step_global_count
+                    )
+                success_step_global_avg = success_step_avg
+
                 if is_metaworld:
                     eval_line = (
-                        f"metaworld_eval episode={info.get('episode')} "
-                        f"task_id={info.get('task_id', -1)} task={info.get('task')} "
-                        f"desc={info.get('desc')} difficulty={info.get('difficulty')} "
-                        f"trial_id={info.get('trial_id', -1)} success={info.get('success')} "
-                        f"return={float(info.get('return', float('nan'))):.4f} "
-                        f"episode_len={episode_len} success_step={success_step} finish_step={finish_step}"
+                        "metaworld_eval episode={episode} task_id={task_id} task={task} "
+                        "desc={desc} difficulty={difficulty} trial_id={trial_id} "
+                        "success={success} return={return:.4f} episode_len={episode_len} "
+                        "success_step={success_step} finish_step={finish_step}".format(
+                            success_step=success_step,
+                            finish_step=finish_step,
+                            **info
+                        )
                     )
                 else:
                     eval_line = (
-                        f"{env_type}_eval episode={info.get('episode')} "
+                        f"{env_type}_eval episode={episode} "
                         f"task_id={info.get('task_id', -1)} "
                         f"trial_id={info.get('trial_id', -1)} "
                         f"reset_state_id={info.get('reset_state_id', -1)} "
-                        f"success={info.get('success')} "
+                        f"success={success_flag} "
                         f"return={float(info.get('return', float('nan'))):.4f} "
-                        f"episode_len={episode_len} success_step={success_step} finish_step={finish_step}"
+                        f"episode_len={episode_len} "
+                        f"success_step={success_step} finish_step={finish_step}"
                     )
                 self._append_spec_log(eval_line)
                 self._append_eval_log(eval_line)
-                success_step_list = success_step_records[stage_id][env_idx]
-                success_step_last = int(success_step_list[-1]) if success_step_list else -1
-                success_step_avg = (
-                    float(sum(success_step_list)) / float(len(success_step_list))
-                    if success_step_list
-                    else -1.0
-                )
-                success_step_global_avg = (
-                    float(success_step_total) / float(success_step_count)
-                    if success_step_count > 0
-                    else -1.0
-                )
-                prefix = "metaworld" if is_metaworld else env_type
-                success_line = (
-                    f"{prefix}_success_steps episode={int(info.get('episode', -1))} "
-                    f"success_step_last={success_step_last} "
-                    f"success_step_avg={success_step_avg:.3f} "
-                    f"success_step_global_avg={success_step_global_avg:.3f} "
-                    f"success_count={len(success_step_list)}"
-                )
-                self._append_eval_log(success_line)
+                if success_count > 0:
+                    success_line = (
+                        f"{prefix}_success_steps episode={episode} "
+                        f"success_step_last={success_step_last} "
+                        f"success_step_avg={success_step_avg:.3f} "
+                        f"success_step_global_avg={success_step_global_avg:.3f} "
+                        f"success_count={success_count}"
+                    )
+                    self._append_spec_log(success_line)
+                    self._append_eval_log(success_line)
                 if spec_accept_lengths[stage_id] is None:
                     continue
                 accept_list = spec_accept_lengths[stage_id][env_idx]
                 accept_exec_list = spec_accept_exec_lengths[stage_id][env_idx]
+                prefill_ms_list = spec_timing_prefill_ms[stage_id][env_idx]
+                diffusion_ms_full_list = spec_timing_diffusion_ms_full[stage_id][env_idx]
+                verify_prefill_ms_list = spec_timing_verify_prefill_ms[stage_id][env_idx]
+                verify_diffusion_ms_list = spec_timing_verify_diffusion_ms[stage_id][env_idx]
+                verify_check_ms_list = spec_timing_verify_check_ms[stage_id][env_idx]
+                verify_total_ms_list = spec_timing_verify_total_ms[stage_id][env_idx]
+                verify_calls_list = spec_timing_verify_calls[stage_id][env_idx]
+                prefill_ms_per_env_list = spec_timing_prefill_ms_per_env[stage_id][env_idx]
+                end2end_ms_per_step_list = spec_timing_end2end_ms_per_step[stage_id][env_idx]
+                has_timing = bool(
+                    prefill_ms_list
+                    or diffusion_ms_full_list
+                    or verify_prefill_ms_list
+                    or verify_diffusion_ms_list
+                    or verify_check_ms_list
+                    or verify_total_ms_list
+                    or verify_calls_list
+                    or prefill_ms_per_env_list
+                    or end2end_ms_per_step_list
+                )
+                has_verify_timing = bool(
+                    verify_prefill_ms_list
+                    or verify_diffusion_ms_list
+                    or verify_check_ms_list
+                    or verify_total_ms_list
+                    or verify_calls_list
+                )
+                prefill_ms_avg = _mean_or_nan(prefill_ms_list) if has_timing else float("nan")
+                diffusion_ms_full_avg = (
+                    _mean_or_nan(diffusion_ms_full_list) if has_timing else float("nan")
+                )
+                verify_prefill_ms_avg = (
+                    _mean_or_nan(verify_prefill_ms_list) if has_timing else float("nan")
+                )
+                verify_diffusion_ms_avg = (
+                    _mean_or_nan(verify_diffusion_ms_list) if has_timing else float("nan")
+                )
+                verify_check_ms_avg = (
+                    _mean_or_nan(verify_check_ms_list) if has_timing else float("nan")
+                )
+                verify_total_ms_avg = (
+                    _mean_or_nan(verify_total_ms_list) if has_timing else float("nan")
+                )
+                verify_calls_avg = _mean_or_nan(verify_calls_list) if has_timing else float("nan")
+                prefill_ms_per_env_avg = (
+                    _mean_or_nan(prefill_ms_per_env_list) if has_timing else float("nan")
+                )
+                end2end_ms_per_step_avg = (
+                    _mean_or_nan(end2end_ms_per_step_list) if has_timing else float("nan")
+                )
                 if accept_list:
                     avg_accept = float(sum(accept_list)) / float(len(accept_list))
                     avg_exec_accept = (
@@ -865,6 +991,7 @@ class MultiStepRolloutWorker(Worker):
                         verify_conf = True
                     if verify_seq is None:
                         verify_seq = True
+
                     spec_line = (
                         f"{prefix}_spec episode={int(info['episode'])} "
                         f"verify_conf={int(bool(verify_conf))} verify_seq={int(bool(verify_seq))} "
@@ -880,10 +1007,6 @@ class MultiStepRolloutWorker(Worker):
                         f"conf_mu_abs_mean_dim={_fmt_float_list(conf_mu_abs_mean_dim)} "
                         f"conf_var_mean_dim={_fmt_float_list(conf_var_mean_dim)} "
                         f"conf_var_max_dim={_fmt_float_list(conf_var_max_dim)} "
-                        f"success_step_last={success_step_last} "
-                        f"success_step_avg={success_step_avg:.3f} "
-                        f"success_step_global_avg={success_step_global_avg:.3f} "
-                        f"success_count={len(success_step_list)} "
                         f"reject_dims={reject_dims} global_reject_dims={global_reject_dims} "
                         f"last_reject={reject_msg}"
                     )
@@ -902,6 +1025,34 @@ class MultiStepRolloutWorker(Worker):
                     spec_conf_var_max_dims[stage_id][env_idx] = []
                     spec_verify_conf_flags[stage_id][env_idx] = None
                     spec_verify_seq_flags[stage_id][env_idx] = None
+                if has_timing:
+                    timing_line = (
+                        f"{prefix}_timing episode={int(info['episode'])} "
+                        f"prefill_ms_avg={prefill_ms_avg:.3f} "
+                        f"diffusion_ms_full_avg={diffusion_ms_full_avg:.3f} "
+                        f"prefill_ms_per_env_avg={prefill_ms_per_env_avg:.3f} "
+                        f"end2end_ms_per_step_avg={end2end_ms_per_step_avg:.3f}"
+                    )
+                    if has_verify_timing:
+                        timing_line = (
+                            f"{timing_line} "
+                            f"verify_prefill_ms_avg={verify_prefill_ms_avg:.3f} "
+                            f"verify_diffusion_ms_avg={verify_diffusion_ms_avg:.3f} "
+                            f"verify_check_ms_avg={verify_check_ms_avg:.3f} "
+                            f"verify_total_ms_avg={verify_total_ms_avg:.3f} "
+                            f"verify_calls_avg={verify_calls_avg:.3f}"
+                        )
+                    self._append_spec_log(timing_line)
+                    self._append_eval_log(timing_line)
+                spec_timing_prefill_ms[stage_id][env_idx] = []
+                spec_timing_diffusion_ms_full[stage_id][env_idx] = []
+                spec_timing_verify_prefill_ms[stage_id][env_idx] = []
+                spec_timing_verify_diffusion_ms[stage_id][env_idx] = []
+                spec_timing_verify_check_ms[stage_id][env_idx] = []
+                spec_timing_verify_total_ms[stage_id][env_idx] = []
+                spec_timing_verify_calls[stage_id][env_idx] = []
+                spec_timing_prefill_ms_per_env[stage_id][env_idx] = []
+                spec_timing_end2end_ms_per_step[stage_id][env_idx] = []
             if items:
                 last = items[-1]
                 if is_metaworld:
@@ -980,16 +1131,16 @@ class MultiStepRolloutWorker(Worker):
                             )
                         for local_idx, env_idx in enumerate(need_plan):
                             plan_actions = None
-                            if isinstance(spec_info_list, list) and local_idx < len(
-                                spec_info_list
-                            ):
+                            spec_mode = isinstance(spec_info_list, list)
+                            if spec_mode and local_idx < len(spec_info_list):
                                 info = spec_info_list[local_idx]
                                 if isinstance(info, dict):
                                     accepted_actions = info.get("accepted_actions")
                                     if accepted_actions is not None:
                                         plan_actions = np.asarray(accepted_actions)
-                            if plan_actions is None and actions_new is not None:
-                                plan_actions = np.asarray(actions_new[local_idx])
+                            if actions_new is not None:
+                                if plan_actions is None:
+                                    plan_actions = np.asarray(actions_new[local_idx])
                             if plan_actions is None:
                                 continue
                             if plan_actions.ndim == 1:

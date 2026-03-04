@@ -24,6 +24,7 @@ set -euo pipefail
 # bash examples/embodiment/eval_embodiment.sh libero_spatial_grpo_openpi_pi05-15base
 # bash examples/embodiment/eval_embodiment.sh libero_spatial_grpo_openpi_pi05-15sp
 
+bash examples/embodiment/eval_embodiment.sh libero_spatial_grpo_openpi_pi05-10sp_time
 
 # bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-1base
 # bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-2base
@@ -35,9 +36,9 @@ set -euo pipefail
 # bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-8base
 
 
-bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-8sp \
-    actor.model.openpi.spec_verify_conf=true \
-    actor.model.openpi.spec_verify_seq=true
+# bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-8sp \
+#     actor.model.openpi.spec_verify_conf=true \
+#     actor.model.openpi.spec_verify_seq=true
 # bash examples/embodiment/eval_embodiment.sh maniskill_ppo_openpi_pi05-8sp \
 #     actor.model.openpi.spec_verify_conf=false \
 #     actor.model.openpi.spec_verify_seq=true

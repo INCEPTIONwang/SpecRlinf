@@ -41,7 +41,7 @@ algorithm:
   group_size: 8
   reward_coef: 1.0
   rollout_epoch: 8
-  eval_rollout_epoch: 10 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
+  eval_rollout_epoch: 25 # set eval_rollout_epoch > 0 when enable runner.only_eval or runner.val_check_interval > 0
 
   reward_type: chunk_level
   logprob_type: chunk_level
@@ -93,7 +93,7 @@ env:
     max_episode_steps: 240 # max episode steps for truncation
     max_steps_per_rollout_epoch: 240
   eval:
-    total_num_envs: 50
+    total_num_envs: 20
     auto_reset: True
     ignore_terminations: True
     max_episode_steps: 240

@@ -527,6 +527,27 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if actions.shape[1] > int(eval_horizon):
             actions = actions[:, : int(eval_horizon)]
         result: dict[str, Any] = {}
+        timing_info = outputs.get("timing_info", None)
+        if isinstance(timing_info, dict) and timing_info:
+            env_batch = int(actions.shape[0])
+            plan_steps = int(actions.shape[1]) if actions.ndim >= 2 else 0
+            prefill_ms = float(timing_info.get("prefill_ms", 0.0))
+            diffusion_ms_full = float(timing_info.get("diffusion_ms_full", 0.0))
+            verify_total_ms = float(timing_info.get("verify_total_ms", 0.0))
+            end2end_ms = float(prefill_ms + diffusion_ms_full + verify_total_ms)
+            prefill_ms_per_env = (
+                float(prefill_ms) / float(env_batch) if env_batch > 0 else float("nan")
+            )
+            end2end_ms_per_step = (
+                float(end2end_ms) / float(plan_steps) if plan_steps > 0 else float("nan")
+            )
+            enriched = dict(timing_info)
+            enriched["timing_batch_size"] = int(env_batch)
+            enriched["timing_plan_steps"] = int(plan_steps)
+            enriched["prefill_ms_per_env"] = float(prefill_ms_per_env)
+            enriched["end2end_ms"] = float(end2end_ms)
+            enriched["end2end_ms_per_step"] = float(end2end_ms_per_step)
+            result["spec_info"] = [dict(enriched) for _ in range(env_batch)]
         if return_obs:
             result["forward_inputs"] = None
         return actions, result
@@ -534,15 +555,42 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
     def _predict_action_batch_segment(self, env_obs, return_obs=True) -> tuple[np.ndarray, dict[str, Any]]:
         env_batch = env_obs["states"].shape[0]
         actions_out = []
+        spec_infos = []
         for env_idx in range(env_batch):
             single_env_obs = self._slice_env_obs(env_obs, env_idx)
-            action_seq = self._segment_decode_single(single_env_obs)
+            action_seq, timing_info = self._segment_decode_single(single_env_obs)
             actions_out.append(action_seq)
+            spec_infos.append(timing_info)
         actions = np.stack(actions_out, axis=0)
         eval_horizon = self._eval_action_horizon()
         if actions.shape[1] > int(eval_horizon):
             actions = actions[:, : int(eval_horizon)]
         result: dict[str, Any] = {}
+        if any(isinstance(info, dict) and bool(info) for info in spec_infos):
+            plan_steps = int(actions.shape[1]) if actions.ndim >= 2 else 0
+            enriched_infos = []
+            for info in spec_infos:
+                if not isinstance(info, dict):
+                    enriched_infos.append({})
+                    continue
+                enriched = dict(info)
+                prefill_ms = float(enriched.get("prefill_ms", 0.0))
+                diffusion_ms_full = float(enriched.get("diffusion_ms_full", 0.0))
+                verify_total_ms = float(enriched.get("verify_total_ms", 0.0))
+                end2end_ms = float(prefill_ms + diffusion_ms_full + verify_total_ms)
+                end2end_ms_per_step = (
+                    float(end2end_ms) / float(plan_steps) if plan_steps > 0 else float("nan")
+                )
+                enriched["timing_batch_size"] = 1
+                enriched["timing_plan_steps"] = int(plan_steps)
+                enriched["prefill_ms_per_env"] = float(prefill_ms)
+                enriched["end2end_ms"] = float(end2end_ms)
+                enriched["end2end_ms_per_step"] = float(end2end_ms_per_step)
+                enriched_infos.append(enriched)
+            result["spec_info"] = [
+                dict(info) if isinstance(info, dict) else {}
+                for info in enriched_infos
+            ]
         if return_obs:
             result["forward_inputs"] = None
         return actions, result
@@ -627,7 +675,7 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         )
         return chunk, info
 
-    def _segment_decode_single(self, env_obs: dict[str, Any]) -> np.ndarray:
+    def _segment_decode_single(self, env_obs: dict[str, Any]) -> tuple[np.ndarray, dict[str, Any]]:
         to_process_obs = self.obs_processor(env_obs)
         processed_obs = self.input_transform(to_process_obs, transpose=False)
         processed_obs = self.precision_processor(processed_obs)
@@ -647,7 +695,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             chunked=True,
             timing_enabled=timing_enabled,
         )
-        return np.asarray(actions_exec[0])
+        timing_info = _timing_info if isinstance(_timing_info, dict) else {}
+        return np.asarray(actions_exec[0]), timing_info
 
     def _spec_action_horizon(self) -> int:
         action_horizon = getattr(self.config, "spec_action_horizon", None)
@@ -1049,6 +1098,11 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=False)
 
         timing_enabled = bool(profile_timing) and device.type == "cuda"
+        if timing_enabled:
+            # Reset per-call timers so cache-hit verification does not inherit
+            # previous prefill timings.
+            self.last_timing_prefill_ms = 0.0
+            self.last_timing_diffusion_ms = 0.0
         use_prefix_cache = False
         if prefix_cache is not None:
             prefix_pad_masks, past_key_values = prefix_cache
@@ -1479,6 +1533,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         seq_active = seq_enabled
         conf_stop_prefix_len: int | None = None
         seq_stop_prefix_len: int | None = None
+        verify_prefill_ms = 0.0
+        verify_diffusion_ms = 0.0
+        verify_check_ms = 0.0
+        verify_calls = 0
 
         verify_rng_state = self._snapshot_rng_state()
         try:
@@ -1533,6 +1591,8 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                 obs_verify = self._repeat_observation(observation, k_total)
                 fixed_actions_t = torch.as_tensor(fixed_actions_batch, device=observation.state.device)
                 fixed_action_mask_t = torch.as_tensor(fixed_action_mask_batch, device=observation.state.device)
+                if timing_enabled and observation.state.device.type == "cuda":
+                    torch.cuda.synchronize(observation.state.device)
                 verify_actions_raw = self._spec_sample_actions(
                     obs_verify,
                     num_steps=int(diffusion_num_steps),
@@ -1542,10 +1602,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     prefix_cache=prefix_cache,
                     profile_timing=bool(timing_enabled),
                 )
+                if timing_enabled and observation.state.device.type == "cuda":
+                    torch.cuda.synchronize(observation.state.device)
+                if timing_enabled:
+                    verify_prefill_ms += float(getattr(self, "last_timing_prefill_ms", 0.0))
+                    verify_diffusion_ms += float(getattr(self, "last_timing_diffusion_ms", 0.0))
+                    verify_calls += 1
                 verify_actions = self._apply_output_transform(
                     verify_actions_raw, obs_verify.state, limit_chunk=False
                 )
                 verify_actions_raw_np = verify_actions_raw.detach().float().cpu().numpy()
+                verify_check_t0 = 0.0
+                if timing_enabled:
+                    verify_check_t0 = time.perf_counter()
 
                 if conf_active:
                     (
@@ -1607,8 +1676,18 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
                     and _prefix_len(accepted_positions_conf) >= int(seq_stop_prefix_len)
                 ):
                     conf_active = False
+                if timing_enabled:
+                    verify_check_ms += float((time.perf_counter() - verify_check_t0) * 1000.0)
                 if not conf_active and not seq_active:
                     break
+            if timing_enabled:
+                timing_info["verify_calls"] = int(verify_calls)
+                timing_info["verify_prefill_ms"] = float(verify_prefill_ms)
+                timing_info["verify_diffusion_ms"] = float(verify_diffusion_ms)
+                timing_info["verify_check_ms"] = float(verify_check_ms)
+                timing_info["verify_total_ms"] = float(
+                    verify_prefill_ms + verify_diffusion_ms + verify_check_ms
+                )
         finally:
             # Keep speculative verification from perturbing the global RNG stream.
             self._restore_rng_state(verify_rng_state)
@@ -1685,6 +1764,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         if append_pos is not None:
             info["append_pos"] = int(append_pos)
         if timing_enabled:
+            prefill_ms = float(timing_info.get("prefill_ms", 0.0))
+            diffusion_ms_full = float(timing_info.get("diffusion_ms_full", 0.0))
+            verify_total_ms = float(timing_info.get("verify_total_ms", 0.0))
+            end2end_ms = float(prefill_ms + diffusion_ms_full + verify_total_ms)
+            end2end_ms_per_step = (
+                float(end2end_ms) / float(accepted_exec_len)
+                if int(accepted_exec_len) > 0
+                else float("nan")
+            )
+            timing_info["timing_batch_size"] = 1
+            timing_info["timing_plan_steps"] = int(accepted_exec_len)
+            timing_info["prefill_ms_per_env"] = float(prefill_ms)
+            timing_info["end2end_ms"] = float(end2end_ms)
+            timing_info["end2end_ms_per_step"] = float(end2end_ms_per_step)
             info.update(timing_info)
         return chunk, info
 
@@ -1700,10 +1793,20 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
         bsize = observation.state.shape[0]
         device = observation.state.device
         num_steps = self.config.num_steps
+        timing_enabled = (
+            mode == "eval"
+            and bool(getattr(self.config, "spec_profile_timing", False))
+            and device.type == "cuda"
+        )
+        prefill_ms = 0.0
+        diffusion_ms_full = 0.0
         if noise is None:
             actions_shape = (bsize, self.config.action_horizon, self.config.action_dim)
             noise = self.sample_noise(actions_shape, device)
 
+        if timing_enabled:
+            torch.cuda.synchronize(device=device)
+            t_prefill0 = time.perf_counter()
         images, img_masks, lang_tokens, lang_masks, state = (
             self._preprocess_observation(observation, train=False)
         )
@@ -1725,6 +1828,12 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             inputs_embeds=[prefix_embs, None],
             use_cache=True,
         )
+        if timing_enabled:
+            torch.cuda.synchronize(device=device)
+            t_prefill1 = time.perf_counter()
+            prefill_ms = float((t_prefill1 - t_prefill0) * 1000.0)
+            torch.cuda.synchronize(device=device)
+            t_diffusion0 = time.perf_counter()
 
         x_t = noise
         # add sde sample and traj collect
@@ -1785,6 +1894,10 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values.append(value_t)
             chains.append(x_t)
             log_probs.append(log_prob)
+        if timing_enabled:
+            torch.cuda.synchronize(device=device)
+            t_diffusion1 = time.perf_counter()
+            diffusion_ms_full = float((t_diffusion1 - t_diffusion0) * 1000.0)
         x_0 = x_t
         chains = torch.stack(chains, dim=1)
         # post process for logprob
@@ -1803,13 +1916,19 @@ class OpenPi0ForRLActionPrediction(PI0Pytorch, BasePolicy):
             values = values_vlm[:, None]
         else:
             values = torch.stack(values, dim=1).mean(dim=-1, keepdim=True)
-        return {
+        result = {
             "actions": x_0,
             "chains": chains,
             "prev_logprobs": log_probs,
             "prev_values": values,
             "denoise_inds": denoise_inds,
         }
+        if timing_enabled:
+            result["timing_info"] = {
+                "prefill_ms": float(prefill_ms),
+                "diffusion_ms_full": float(diffusion_ms_full),
+            }
+        return result
 
     def sample_mean_var_val(
         self,
