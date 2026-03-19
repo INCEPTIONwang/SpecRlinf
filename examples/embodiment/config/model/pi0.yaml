@@ -30,3 +30,9 @@ openpi:
   noise_method: "flow_sde"
   add_value_head: ${actor.model.add_value_head}
   detach_critic_input: False
+  # speculative verify switches (eval-only)
+  spec_verify_conf: True
+  spec_verify_seq: True
+  eval_image_perturbation: "none"  # none, mask, blur
+  eval_image_mask_ratio: 0.0  # ratio of masked patches on the vision patch grid, used when perturbation=mask
+  eval_image_blur_kernel_size: 0  # odd Gaussian kernel size, used when perturbation=blur

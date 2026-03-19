@@ -17,7 +17,7 @@ from typing import Any, Optional, Union
 
 import imageio
 import numpy as np
-import tensorflow as tf
+# import tensorflow as tf
 import torch
 from PIL import Image, ImageDraw, ImageFont
 

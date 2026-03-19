@@ -1,0 +1,2 @@
+bash examples/embodiment/eval_embodiment.sh metaworld_50_ppo_openpi_pi05-10sp
+bash examples/embodiment/eval_embodiment.sh metaworld_50_ppo_openpi_pi05-15sp
